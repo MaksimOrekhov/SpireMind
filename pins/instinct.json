@@ -1,0 +1,10 @@
+{
+  "name": "Instinct Ironclad 9.0B EMA 0.999",
+  "release": "weights-2026-11-23",
+  "file": "ironclad_e2e_d9000_ema0999.e2ew",
+  "sha256": "e28871c01e5dcb85f4f141c81a66d0f9f223fd6815e451c8f5d477481440aa61",
+  "bytes": 21205003,
+  "format": "e2ew/1",
+  "game_version": "v0.111.0",
+  "license": "MIT"
+}
