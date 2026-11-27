@@ -215,14 +215,20 @@ fn persist(dir: &Path, job: &Job) -> io::Result<()> {
 
 struct Live {
     latest: Mutex<Latest>,
+    cache: Mutex<Option<CachedAdvice>>,
     wake: Condvar,
     terminal: Terminal,
     ttl: Duration,
 }
 
+struct CachedAdvice {
+    session: u64,
+    observation_id: String,
+    result: Value,
+}
+
 impl Live {
     fn worker(&self, net: E2eNet, capture: Option<PathBuf>) {
-        let mut cached: Option<(u64, String, Value)> = None;
         loop {
             let job = {
                 let state = self.latest.lock().unwrap();
@@ -233,19 +239,19 @@ impl Live {
                 guard.pending.take().unwrap()
             };
             let id = observation_id(&job.observation);
-            let (value, reused) = if let Some((session, previous, advice)) = &cached
-                && *session == job.position.session
-                && *previous == id
-            {
-                (advice.clone(), true)
-            } else {
-                let advice = engine::advise(&net, &job.observation).unwrap_or_else(blocked);
-                if matches!(advice["status"].as_str(), Some("ok" | "forced")) {
-                    let mut reusable = advice.clone();
-                    reusable.as_object_mut().unwrap().remove("forward_ms");
-                    cached = Some((job.position.session, id.clone(), reusable));
-                }
-                (advice, false)
+            let cached = self
+                .cache
+                .lock()
+                .unwrap()
+                .as_ref()
+                .filter(|entry| entry.session == job.position.session && entry.observation_id == id)
+                .map(|entry| entry.result.clone());
+            let (value, reused) = match cached {
+                Some(advice) => (advice, true),
+                None => (
+                    engine::advise(&net, &job.observation).unwrap_or_else(blocked),
+                    false,
+                ),
             };
             let mut result = decorate(value, &job.observation, job.position, "advisor_tcp");
             result["observation_id"] = json!(id);
@@ -270,6 +276,17 @@ impl Live {
         if latest.confirmed
             && let Some((received, mut result)) = latest.completed.take()
         {
+            if result["reused"] == false
+                && matches!(result["status"].as_str(), Some("ok" | "forced"))
+            {
+                let mut reusable = result.clone();
+                reusable.as_object_mut().unwrap().remove("forward_ms");
+                *self.cache.lock().unwrap() = Some(CachedAdvice {
+                    session: latest.position.unwrap().session,
+                    observation_id: result["observation_id"].as_str().unwrap().to_owned(),
+                    result: reusable,
+                });
+            }
             result["receive_to_result_ms"] =
                 json!(now.duration_since(received).as_secs_f64() * 1000.0);
             self.terminal.emit(&result);
@@ -430,6 +447,7 @@ pub fn run(
     }
     let live = Arc::new(Live {
         latest: Mutex::new(Latest::default()),
+        cache: Mutex::new(None),
         wake: Condvar::new(),
         terminal: Terminal {
             json: json_output || !io::stdout().is_terminal(),

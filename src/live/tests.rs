@@ -339,6 +339,7 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     }
     let live = Live {
         latest: Mutex::new(Latest::default()),
+        cache: Mutex::new(None),
         wake: Condvar::new(),
         terminal: Terminal { json: true },
         ttl: Duration::from_secs(1),
@@ -389,6 +390,51 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     );
     let latest = live.latest.lock().unwrap();
     assert!(latest.position.is_none() && latest.pending.is_none() && !latest.confirmed);
+}
+
+#[test]
+fn synthetic_cancelled_result_never_enters_reuse_cache() {
+    let live = Live {
+        latest: Mutex::new(Latest::default()),
+        cache: Mutex::new(None),
+        wake: Condvar::new(),
+        terminal: Terminal { json: true },
+        ttl: Duration::from_secs(1),
+    };
+    let now = Instant::now();
+    let mut latest = Latest::default();
+    let p = Position {
+        session: 1,
+        state_id: 1,
+        request_id: 1,
+    };
+    latest.new_position(p, now);
+    latest.completed = Some((
+        now,
+        json!({"status":"ok","observation_id":"test","reused":false,"forward_ms":1}),
+    ));
+    live.publish(&mut latest, now);
+    assert!(live.cache.lock().unwrap().is_none());
+    live.clear(&mut latest, "producer_withdraw");
+    assert!(!latest.confirm(p, now, live.ttl));
+    live.publish(&mut latest, now);
+    assert!(live.cache.lock().unwrap().is_none());
+    let p = Position {
+        state_id: 2,
+        request_id: 2,
+        ..p
+    };
+    latest.new_position(p, now);
+    latest.completed = Some((
+        now,
+        json!({"status":"ok","observation_id":"test","reused":false,"forward_ms":1}),
+    ));
+    assert!(latest.confirm(p, now, live.ttl));
+    live.publish(&mut latest, now);
+    let cache = live.cache.lock().unwrap();
+    let saved = cache.as_ref().unwrap();
+    assert_eq!(saved.observation_id, "test");
+    assert!(saved.result.get("forward_ms").is_none());
 }
 
 #[test]

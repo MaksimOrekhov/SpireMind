@@ -64,9 +64,15 @@ def summarize(events, captures):
     stale_reasons = Counter()
     observation_ids = defaultdict(Counter)
     decisions = defaultdict(set)
+    scored_decisions = defaultdict(set)
+    scored_observations = defaultdict(set)
     inferred = defaultdict(set)
     forwards = defaultdict(list)
     receive = defaultdict(list)
+    distinct_forwards = defaultdict(list)
+    distinct_receive = defaultdict(list)
+    duplicate_forwards = defaultdict(list)
+    duplicate_receive = defaultdict(list)
     published = {}
     longest = {}
     for event in events:
@@ -83,12 +89,18 @@ def summarize(events, captures):
         elif status in {"ok", "forced"}:
             published[key] = event["elapsed_ms"]
             observation_ids[context][event["observation_id"]] += 1
-            decisions[context].add(decision_key(event, captures.get(key)))
+            decision = decision_key(event, captures.get(key))
+            decisions[context].add(decision)
             if event.get("reused"):
                 contexts[context]["reused"] += 1
             if status == "ok":
+                scored_decisions[context].add(decision)
+                scored_observations[context].add(event["observation_id"])
                 contexts[context]["inference" if "forward_ms" in event else "cached_ok"] += 1
                 if "forward_ms" in event:
+                    repeated = event["observation_id"] in inferred[context]
+                    (duplicate_forwards if repeated else distinct_forwards)[context].append(event["forward_ms"])
+                    (duplicate_receive if repeated else distinct_receive)[context].append(event["receive_to_result_ms"])
                     inferred[context].add(event["observation_id"])
                     forwards[context].append(event["forward_ms"])
                     receive[context].append(event["receive_to_result_ms"])
@@ -104,8 +116,10 @@ def summarize(events, captures):
             "unique_observations_ok_or_forced": len(fingerprints),
             "duplicate_observations_ok_or_forced": sum(fingerprints.values()) - len(fingerprints),
             "distinct_decisions_ok_or_forced": len(decisions[context]),
-            "unique_scored_observations": len(inferred[context]),
-            "duplicate_scored_observations": len(forwards[context]) - len(inferred[context]),
+            "distinct_scored_decisions": len(scored_decisions[context]),
+            "unique_scored_observations": len(scored_observations[context]),
+            "duplicate_scored_observations": counts["ok"] - len(scored_observations[context]),
+            "unique_published_inferences": len(inferred[context]),
             "receive_to_result": latency(receive[context]),
             "forward": latency(forwards[context]),
         }
@@ -115,9 +129,13 @@ def summarize(events, captures):
         "blocked_reasons": dict(reasons),
         "stale_reasons": dict(stale_reasons),
         "contexts": detail,
-        "unique_scored_observations": sum(map(len, inferred.values())),
+        "unique_scored_observations": sum(map(len, scored_observations.values())),
         "receive_to_result": latency([v for ctx in receive.values() for v in ctx]),
         "forward": latency([v for ctx in forwards.values() for v in ctx]),
+        "distinct_receive_to_result": latency([v for ctx in distinct_receive.values() for v in ctx]),
+        "distinct_forward": latency([v for ctx in distinct_forwards.values() for v in ctx]),
+        "duplicate_receive_to_result": latency([v for ctx in duplicate_receive.values() for v in ctx]),
+        "duplicate_forward": latency([v for ctx in duplicate_forwards.values() for v in ctx]),
         "longest_confirmed_display": (
             {"session": longest_position[0], "state_id": longest_position[1],
              "elapsed_ms": longest[longest_position]} if longest_position else None
