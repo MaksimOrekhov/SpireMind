@@ -1,0 +1,47 @@
+name: SM-01 checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    name: Build and contract tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - run: python scripts/setup.py --source-only
+      - run: cargo fmt --check
+      - run: cargo clippy --release --locked --all-targets -- -D warnings
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+
+  model-smoke:
+    name: Original Instinct CPU smoke (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - run: rustup toolchain install 1.99.1 --profile minimal
+      - run: python scripts/setup.py
+      - run: cargo test --release --locked model_smoke -- --ignored --nocapture
