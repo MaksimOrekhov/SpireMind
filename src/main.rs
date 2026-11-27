@@ -32,10 +32,7 @@ impl Failure {
 type Result<T> = std::result::Result<T, Failure>;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Offline, read-only Instinct advisor for simulated Ironclad runs"
-)]
+#[command(version, about = "Local, read-only Instinct advisor for Ironclad")]
 struct Cli {
     #[arg(long, global = true)]
     weights: Option<PathBuf>,
@@ -67,11 +64,11 @@ enum Mode {
     Live {
         #[arg(long, default_value_t = 9002, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
-        #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u64).range(250..=5000))]
+        #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u64).range(1000..=5000))]
         ttl_ms: u64,
-        /// Expect the build from this installed game's release_info.json.
+        /// Verify the installed game's version and commit before connecting.
         #[arg(long)]
-        release_info: Option<PathBuf>,
+        release_info: PathBuf,
         /// Save sanitized observations in this local directory.
         #[arg(long)]
         capture_dir: Option<PathBuf>,
@@ -129,30 +126,17 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             capture_dir,
             json,
         } => {
-            let installed = release_info
-                .as_deref()
-                .map(live::release_build)
-                .transpose()?;
+            let installed = live::release_build(&release_info)?;
             if let Some(requested) = cli.game_version.as_deref() {
                 live::check_version(requested)?;
-                if installed
-                    .as_deref()
-                    .is_some_and(|actual| actual != requested)
-                {
+                if installed != requested {
                     return Err(Failure::new(
                         "producer_mismatch",
                         "Requested version differs from release_info.json",
                     ));
                 }
             }
-            live::run(
-                net,
-                port,
-                ttl_ms,
-                json,
-                capture_dir,
-                installed.as_deref().or(cli.game_version.as_deref()),
-            )?;
+            live::run(net, port, ttl_ms, json, capture_dir, &installed)?;
             Ok((json!({"status":"stopped"}), true))
         }
         Mode::Replay { captures } => live::replay(&net, &captures),

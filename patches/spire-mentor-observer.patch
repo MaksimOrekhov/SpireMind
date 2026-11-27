@@ -1,0 +1,309 @@
+diff --git a/spire-mentor-mod/BridgeServer.cs b/spire-mentor-mod/BridgeServer.cs
+--- a/spire-mentor-mod/BridgeServer.cs
++++ b/spire-mentor-mod/BridgeServer.cs
+@@ -26,6 +26,18 @@
+     private TcpListener? _tcpListener;
+     private TcpClient? _client;
+     private NetworkStream? _netStream;
++    private long _clientGeneration;
++
++    internal long ClientGeneration
++    {
++        get
++        {
++            lock (_clientLock)
++            {
++                return _client != null && _client.Connected ? _clientGeneration : 0;
++            }
++        }
++    }
+     private volatile bool _running;
+     private CancellationTokenSource? _cts;
+
+@@ -209,11 +221,17 @@
+     /// flushes. Returns false when there is no connected client or the write
+     /// failed (the client is then dropped). Never throws.
+     /// </summary>
+-    private bool TryWriteLine(string stateJson)
++    internal void SendObserverState(long generation, string stateJson)
++    {
++        TryWriteLine(stateJson, generation);
++    }
++
++    private bool TryWriteLine(string stateJson, long? generation = null)
+     {
+         lock (_clientLock)
+         {
+-            if (_netStream == null || _client == null || !_client.Connected)
++            if (_netStream == null || _client == null || !_client.Connected ||
++                (generation.HasValue && generation.Value != _clientGeneration))
+             {
+                 return false;
+             }
+@@ -417,6 +435,7 @@
+                     stream.WriteTimeout = WriteTimeoutMs;
+                     stream.ReadTimeout = Timeout.Infinite;
+                     _client = client;
++                    _clientGeneration++;
+                     _netStream = stream;
+                     _lineRemainder = "";
+                     _sawFirstLine = false;
+diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
+--- a/spire-mentor-mod/SimAdvisor.cs
++++ b/spire-mentor-mod/SimAdvisor.cs
+@@ -296,6 +296,10 @@
+     // Last decision the poll saw, so it only reacts to actual changes.
+     private GodotObject? _polledScreen;
+     private string _polledSignature = "";
++    private long _observerConnection;
++    private long _inflightObserverConnection;
++    private string? _inflightObserverKey;
++    private SpireMindLease? _observerLease;
+
+     /// <summary>
+     /// An advice request was abandoned because the advisor's socket was not up
+@@ -522,6 +526,7 @@
+             }
+             else
+             {
++                RetireObserver();
+                 SetAutoPlay(false);
+                 DropInflight();
+                 // The advisor goes with the mode: so does what it could play.
+@@ -621,6 +626,9 @@
+             // differs (where we stand, what is on offer, what it costs).
+             string signature = current?.SignatureOrDefault ?? "";
+             bool unchanged = ReferenceEquals(screen, _polledScreen) && signature == _polledSignature;
++            long connection = BridgeServer.Instance.ClientGeneration;
++            bool reconnected = connection != 0 && connection != _observerConnection;
++            _observerConnection = connection;
+             // Every tick, changed or not: a decision that just closed waits a
+             // few ticks for its pick to land in the deck / relics / map.
+             SimChoiceCapture.OnPoll(current, changed: !unchanged);
+@@ -636,11 +644,15 @@
+                 // the Python advisor's socket arriving, and the run sat on the
+                 // first decision of the game indefinitely. The same hole swallows
+                 // any advisor restart mid-run.
+-                if (_adviceDeferredNoClient && BridgeServer.Instance.IsClientConnected)
++                if (reconnected || (_adviceDeferredNoClient && BridgeServer.Instance.IsClientConnected))
+                 {
+                     _adviceDeferredNoClient = false;
+                     Logger.Log("[SimAdvisor] Advisor connected; re-requesting advice for the current decision.");
+                     ScheduleAdvice();
++                }
++                else
++                {
++                    ConfirmObserver(current);
+                 }
+                 return;
+             }
+@@ -758,6 +770,7 @@
+         {
+             return;
+         }
++        RetireObserver();
+         ReportCombatEnded(round, roomType);
+         DropInflight();
+         SimHud.Instance.ClearAdvice();
+@@ -988,6 +1001,7 @@
+
+     private void ScheduleAdvice()
+     {
++        RetireObserver();
+         _lastBest = null; // board is (about to be) different; stale recommendation must not execute
+         _lastScreen = null;
+         // A peek is for one decision only: it hides once that is made.
+@@ -1331,7 +1345,7 @@
+             }
+
+             CombatManager cm = CombatManager.Instance;
+-            if (!cm.IsInProgress || cm.PlayerActionsDisabled)
++            if (!cm.IsInProgress || cm.PlayerActionsDisabled || SimRoomNodes.MapOpen() || SimRoomNodes.OverlayUp())
+             {
+                 // Not a decision point; keep whatever advice is showing
+                 // (mid-animation) -- staleness is handled by the events
+@@ -1429,6 +1443,10 @@
+             {
+                 state["combat_log"] = combatLog;
+                 state["capabilities"] = ModCapabilities();
++                // This is the same current-act graph the player can inspect
++                // from combat. Serialize it only on requests, never on pulses.
++                if (runState?.CurrentMapCoord != null)
++                    state["map"] = SimStateExtractor.SerializeMapGraph(runState);
+                 AddLanguage(state);
+                 string brain = RequestedBrain;
+                 state["brain"] = brain;
+@@ -1446,6 +1464,7 @@
+                     return;
+                 }
+
++                long connection = BridgeServer.Instance.ClientGeneration;
+                 string? requestId = BridgeServer.Instance.SendAdviceRequest(json, OnAdviceReply);
+                 if (requestId == null)
+                 {
+@@ -1458,6 +1477,8 @@
+                 _inflightRequestId = requestId;
+                 _inflightStateId = stateId;
+                 _inflightEpoch = _positionEpoch;
++                _inflightObserverConnection = connection;
++                _inflightObserverKey = "combat_action";
+                 _inflightSignature = "";
+                 _inflightBrain = brain;
+                 ClearActedFrom();
+@@ -1575,6 +1596,7 @@
+                 return;
+             }
+
++            long connection = BridgeServer.Instance.ClientGeneration;
+             string? requestId = BridgeServer.Instance.SendAdviceRequest(json, OnAdviceReply);
+             if (requestId == null)
+             {
+@@ -1588,6 +1610,8 @@
+             _inflightStateId = stateId;
+             _inflightScreen = screen.Screen;
+             _inflightEpoch = _positionEpoch;
++            _inflightObserverConnection = connection;
++            _inflightObserverKey = ObserverKey(screen);
+             _inflightSignature = screen.SignatureOrDefault;
+             _inflightBrain = brain;
+             ClearActedFrom();
+@@ -1705,6 +1729,7 @@
+                 ? s
+                 : -1;
+
++            bool observes = SpireMindLease.OptedIn(root);
+             SimAdvice advice = root.TryGetProperty("advice", out JsonElement adviceEl)
+                 ? SimAdvice.Parse(adviceEl)
+                 : new SimAdvice();
+@@ -1748,6 +1773,14 @@
+                 bool samePosition = isCombat
+                     ? _inflightEpoch == _positionEpoch
+                     : ReferenceEquals(forScreen, _polledScreen) && forSignature == _polledSignature;
++                if (observes && samePosition && requestId != null &&
++                    stateId > 0 && _inflightEpoch == _positionEpoch && _inflightObserverKey != null)
++                {
++                    RetireObserver();
++                    _observerLease = new SpireMindLease(_inflightObserverConnection, requestId,
++                        stateId, _positionEpoch, forScreen, _inflightObserverKey);
++                    ConfirmObserver(SimScreenAdvice.Describe());
++                }
+                 _inflightRequestId = null;
+                 _inflightStateId = -1;
+                 _inflightScreen = null;
+@@ -3153,7 +3186,78 @@
+     /// <summary>`capabilities` this mod build advertises on every
+     /// advice_request (PROTOCOL.md section 5): coach 2 = chips plus the v5.1
+     /// recap / autopsy records.</summary>
+-    private static Dictionary<string, object> ModCapabilities() => new() { ["coach"] = 2 };
++    private static Dictionary<string, object> ModCapabilities() =>
++        new() { ["coach"] = 2, ["spiremind_lease"] = 1 };
++
++    private static string? ObserverKey(SimScreenDecision screen)
++    {
++        string[] keys;
++        string field;
++        if (screen.AdviceFor == "card_reward")
++        {
++            field = "cards";
++            keys = new[] { "index", "id", "upgrade_level", "upgraded", "cost", "enchantment", "enchantment_amount" };
++        }
++        else if (screen.AdviceFor == "map_select")
++        {
++            field = "nodes";
++            keys = new[] { "index", "row", "col", "type" };
++        }
++        else
++        {
++            return null;
++        }
++        if (!screen.State.TryGetValue(field, out object? value) ||
++            value is not IEnumerable<Dictionary<string, object?>> options)
++            return null;
++        return JsonSerializer.Serialize(new
++        {
++            screen.AdviceFor,
++            screen.SignatureOrDefault,
++            Floor = screen.State.GetValueOrDefault("floor"),
++            CanSkip = screen.State.GetValueOrDefault("can_skip"),
++            Options = options.Select(option => keys.Select(key => option.GetValueOrDefault(key)).ToArray())
++        });
++    }
++
++    private void ConfirmObserver(SimScreenDecision? screen)
++    {
++        if (_observerLease is not { } lease)
++            return;
++        object? visibleScreen = null;
++        string? key = null;
++        if (SimRuntime.Mode == SimMode.Advisor && Engine.GetMainLoop() is SceneTree { Paused: false })
++        {
++            if (screen != null && screen.Screen is CanvasItem item && item.IsVisibleInTree())
++            {
++                visibleScreen = screen.Screen;
++                key = ObserverKey(screen);
++            }
++            else if (screen == null && !SimRoomNodes.MapOpen() && !SimRoomNodes.OverlayUp() &&
++                     CombatManager.Instance.IsInProgress && !CombatManager.Instance.PlayerActionsDisabled &&
++                     LocalContext.GetMe(RunManager.Instance.DebugOnlyGetState())?.PlayerCombatState?.Phase == PlayerTurnPhase.Play)
++            {
++                key = "combat_action";
++            }
++        }
++        BridgeServer bridge = BridgeServer.Instance;
++        string? frame = lease.Confirm(bridge.ClientGeneration, _positionEpoch, visibleScreen, key);
++        if (frame != null)
++            bridge.SendObserverState(lease.Connection, frame);
++        else
++        {
++            RetireObserver();
++            ScheduleAdvice();
++        }
++    }
++
++    private void RetireObserver()
++    {
++        if (_observerLease is not { } lease)
++            return;
++        _observerLease = null;
++        BridgeServer.Instance.SendObserverState(lease.Connection, lease.Withdraw());
++    }
+
+     /// <summary>`language` on the player's advice_request (PROTOCOL.md
+     /// v5.4): "zh" while the mod shows Chinese (<see cref="L10n.IsZh"/>), so
+diff --git a/spire-mentor-mod/SpireMindLease.cs b/spire-mentor-mod/SpireMindLease.cs
+new file mode 100644
+--- /dev/null
++++ b/spire-mentor-mod/SpireMindLease.cs
+@@ -0,0 +1,32 @@
++// Position-specific lease for SpireMind. This class has no game dependencies.
++using System.Text.Json;
++
++namespace SpireMentor;
++
++internal sealed class SpireMindLease(long connection, string requestId, long stateId,
++    long epoch, object? screen, string key)
++{
++    private long _sequence;
++    private bool _withdrawn;
++    public long Connection => connection;
++
++    public static bool OptedIn(JsonElement root) =>
++        root.TryGetProperty("capabilities", out JsonElement caps) && caps.ValueKind == JsonValueKind.Object &&
++        caps.TryGetProperty("spiremind_lease", out JsonElement lease) && lease.ValueKind == JsonValueKind.Number &&
++        lease.TryGetInt32(out int version) && version == 1;
++
++    public string? Confirm(long currentConnection, long currentEpoch, object? currentScreen, string? currentKey)
++    {
++        if (_withdrawn || connection <= 0 || connection != currentConnection || epoch != currentEpoch ||
++            !ReferenceEquals(screen, currentScreen) || key != currentKey)
++            return null;
++        return JsonSerializer.Serialize(new { type = "spiremind_confirm", request_id = requestId,
++            state_id = stateId, lease_seq = ++_sequence });
++    }
++
++    public string Withdraw()
++    {
++        _withdrawn = true;
++        return JsonSerializer.Serialize(new { type = "spiremind_withdraw", request_id = requestId, state_id = stateId });
++    }
++}

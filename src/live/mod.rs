@@ -10,12 +10,13 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     net::{Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sts2_e2e::net::E2eNet;
 
 use crate::{Failure, Result, model};
@@ -38,7 +39,9 @@ struct Latest {
     position: Option<Position>,
     received: Option<Instant>,
     display: bool,
+    confirmed: bool,
     pending: Option<Job>,
+    completed: Option<(Instant, Value)>,
 }
 
 impl Latest {
@@ -55,6 +58,23 @@ impl Latest {
                 .received
                 .is_some_and(|t| now.saturating_duration_since(t) < ttl)
     }
+
+    fn confirm(&mut self, p: Position, at: Instant, ttl: Duration) -> bool {
+        if !self.valid(p, at, ttl) {
+            return false;
+        }
+        self.received = Some(at);
+        self.confirmed = true;
+        true
+    }
+}
+
+fn observation_id(obs: &Observation) -> String {
+    let mut board = obs.board.clone();
+    let fields = board.as_object_mut().expect("sanitized observation object");
+    fields.remove("state_id");
+    fields.remove("request_id");
+    format!("{:x}", Sha256::digest(board.to_string().as_bytes()))
 }
 
 struct Terminal {
@@ -63,8 +83,14 @@ struct Terminal {
 
 impl Terminal {
     fn emit(&self, event: &Value) {
+        if event["status"] == "confirmed" && !self.json {
+            return;
+        }
         let mut out = io::stdout().lock();
         if self.json {
+            static STARTED: OnceLock<Instant> = OnceLock::new();
+            let mut event = event.clone();
+            event["elapsed_ms"] = json!(STARTED.get_or_init(Instant::now).elapsed().as_millis());
             let _ = writeln!(out, "{event}");
         } else {
             let status = event["status"].as_str().unwrap_or("unknown");
@@ -196,6 +222,7 @@ struct Live {
 
 impl Live {
     fn worker(&self, net: E2eNet, capture: Option<PathBuf>) {
+        let mut cached: Option<(u64, String, Value)> = None;
         loop {
             let job = {
                 let state = self.latest.lock().unwrap();
@@ -205,16 +232,30 @@ impl Live {
                     .unwrap();
                 guard.pending.take().unwrap()
             };
-            let value = engine::advise(&net, &job.observation).unwrap_or_else(blocked);
+            let id = observation_id(&job.observation);
+            let (value, reused) = if let Some((session, previous, advice)) = &cached
+                && *session == job.position.session
+                && *previous == id
+            {
+                (advice.clone(), true)
+            } else {
+                let advice = engine::advise(&net, &job.observation).unwrap_or_else(blocked);
+                if matches!(advice["status"].as_str(), Some("ok" | "forced")) {
+                    let mut reusable = advice.clone();
+                    reusable.as_object_mut().unwrap().remove("forward_ms");
+                    cached = Some((job.position.session, id.clone(), reusable));
+                }
+                (advice, false)
+            };
             let mut result = decorate(value, &job.observation, job.position, "advisor_tcp");
+            result["observation_id"] = json!(id);
+            result["reused"] = json!(reused);
             {
                 let mut guard = self.latest.lock().unwrap();
                 let now = Instant::now();
                 if guard.valid(job.position, now, self.ttl) {
-                    result["receive_to_result_ms"] =
-                        json!(now.duration_since(job.received).as_secs_f64() * 1000.0);
-                    self.terminal.emit(&result);
-                    guard.display = true;
+                    guard.completed = Some((job.received, result));
+                    self.publish(&mut guard, now);
                 }
             }
             if let Some(dir) = capture.as_deref()
@@ -225,22 +266,33 @@ impl Live {
         }
     }
 
-    fn invalidate(&self, reason: &'static str) {
-        let mut latest = self.latest.lock().unwrap();
-        let position = latest.position;
-        *latest = Latest::default();
-        self.terminal.emit(
-            &json!({"schema_version":1,"status":"stale","reason":reason,"position":position}),
-        );
+    fn publish(&self, latest: &mut Latest, now: Instant) {
+        if latest.confirmed
+            && let Some((received, mut result)) = latest.completed.take()
+        {
+            result["receive_to_result_ms"] =
+                json!(now.duration_since(received).as_secs_f64() * 1000.0);
+            self.terminal.emit(&result);
+            latest.display = true;
+        }
     }
 
-    fn expire(&self) {
+    fn clear(&self, latest: &mut Latest, reason: &'static str) {
+        if let Some(position) = latest.position {
+            *latest = Latest::default();
+            self.terminal.emit(
+                &json!({"schema_version":1,"status":"stale","reason":reason,"position":position}),
+            );
+        }
+    }
+
+    fn expire(&self) -> bool {
         let mut l = self.latest.lock().unwrap();
         if l.position.is_some() && l.received.is_some_and(|t| t.elapsed() >= self.ttl) {
-            let position = l.position;
-            *l = Latest::default();
-            self.terminal.emit(&json!({"schema_version":1,"status":"stale","reason":"observation_ttl","position":position}));
+            self.clear(&mut l, "observation_ttl");
+            return true;
         }
+        false
     }
 
     fn begin(&self, p: Position, t: Instant) {
@@ -260,12 +312,7 @@ impl Live {
         }
     }
 
-    fn connection(
-        &self,
-        mut socket: TcpStream,
-        id: u64,
-        expected_build: Option<&str>,
-    ) -> Result<()> {
+    fn connection(&self, mut socket: TcpStream, id: u64, expected_build: &str) -> Result<()> {
         socket
             .set_read_timeout(Some(READ_POLL))
             .map_err(|_| link_error())?;
@@ -276,17 +323,16 @@ impl Live {
         self.serve(&mut socket, id, expected_build)
     }
 
-    fn serve(
-        &self,
-        socket: &mut (impl Read + Write),
-        id: u64,
-        expected_build: Option<&str>,
-    ) -> Result<()> {
+    fn serve(&self, socket: &mut (impl Read + Write), id: u64, expected_build: &str) -> Result<()> {
         self.terminal.emit(&json!({"schema_version":1,"status":"waiting","reason":"Connected. Waiting for Advisor observations."}));
         let mut frames = Frames::default();
         let mut session = Session::new(id);
         loop {
-            self.expire();
+            if self.expire() {
+                // A gap invalidates the lease. A fresh connection obtains a
+                // fresh request instead of reviving the position from a late pulse.
+                return Ok(());
+            }
             match frames.read(socket).map_err(|_| link_error())? {
                 Receive::Idle => continue,
                 Receive::Eof => return Ok(()),
@@ -296,12 +342,28 @@ impl Live {
                     drop(bytes);
                     match session.accept(&raw)? {
                         Event::Ignore => {}
-                        Event::Invalidate(reason) => self.invalidate(reason),
+                        Event::Invalidate(reason) => {
+                            self.clear(&mut self.latest.lock().unwrap(), reason)
+                        }
+                        Event::Withdraw(p) => {
+                            let mut current = self.latest.lock().unwrap();
+                            if current.position == Some(p) {
+                                self.clear(&mut current, "producer_withdraw");
+                            }
+                        }
+                        Event::Confirm(p, seq) => {
+                            let mut current = self.latest.lock().unwrap();
+                            if current.confirm(p, at, self.ttl) {
+                                if self.terminal.json {
+                                    self.terminal.emit(&json!({"schema_version":1,"status":"confirmed","position":p,"lease_seq":seq}));
+                                }
+                                self.publish(&mut current, Instant::now());
+                            }
+                        }
                         Event::Observation(p) => {
-                            self.begin(p, at);
                             let actual = observation::string(&raw, "game_version")?;
                             observation::live_build(actual)?;
-                            if expected_build.is_some_and(|v| v != actual)
+                            if expected_build != actual
                                 || raw["mod_version"] != observation::MOD
                                 || raw["player_count"] != 1
                             {
@@ -310,6 +372,13 @@ impl Live {
                                     "Version, mod or player count differs from the admitted producer",
                                 ));
                             }
+                            if raw["capabilities"]["spiremind_lease"] != 1 {
+                                return Err(Failure::new(
+                                    "lease_not_supported",
+                                    "Install the pinned SpireMind observer patch before using live",
+                                ));
+                            }
+                            self.begin(p, at);
                             // A screen request remains in flight without this reply.
                             // The Ack has no best, options, gameplay fields or score.
                             let mut ack = serde_json::to_vec(&Ack::for_position(p))
@@ -317,7 +386,6 @@ impl Live {
                             ack.push(b'\n');
                             socket.write_all(&ack).map_err(|_| link_error())?;
                             let obs = session.observe(&raw, p);
-                            drop(raw);
                             match obs {
                                 Ok(observation) => self.queue(Job {
                                     position: p,
@@ -327,7 +395,10 @@ impl Live {
                                 Err(e) => {
                                     let mut event = blocked(e);
                                     event["position"] = json!(p);
+                                    event["context"] = json!(observation::context(&raw).ok());
                                     self.terminal.emit(&event);
+                                    // Unsupported/ill-formed screens may have no lease.
+                                    *self.latest.lock().unwrap() = Latest::default();
                                 }
                             }
                         }
@@ -351,7 +422,7 @@ pub fn run(
     ttl_ms: u64,
     json_output: bool,
     capture: Option<PathBuf>,
-    expected_build: Option<&str>,
+    expected_build: &str,
 ) -> Result<()> {
     if let Some(path) = capture.as_deref() {
         fs::create_dir_all(path)
@@ -380,8 +451,14 @@ pub fn run(
         if let Ok(socket) = TcpStream::connect_timeout(&address, RECONNECT) {
             session_id += 1;
             let reason = live.connection(socket, session_id, expected_build).err();
-            live.invalidate("disconnect");
+            live.clear(&mut live.latest.lock().unwrap(), "disconnect");
             if let Some(error) = reason {
+                if matches!(
+                    error.code,
+                    "lease_not_supported" | "producer_mismatch" | "incompatible_game_version"
+                ) {
+                    return Err(error);
+                }
                 live.terminal.emit(&blocked(error));
             }
         }
@@ -463,6 +540,7 @@ pub fn replay(net: &E2eNet, files: &[PathBuf]) -> Result<(Value, bool)> {
             "replay",
         );
         let ms = at.elapsed().as_secs_f64() * 1000.0;
+        value["observation_id"] = json!(observation_id(&obs));
         if value["status"] == "ok" {
             times.push(ms);
         }

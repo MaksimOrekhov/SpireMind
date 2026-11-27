@@ -13,14 +13,16 @@
 
 Способ подключения проверен по pinned исходникам мода, включая `ApplyEnvelope`, `SendAdviceRequest`, `OnAdviceReply`, `SimChoiceCapture`, `board::combat_wire` и seedless `graft_run`. Подключение не требует протокола Autopilot. [Описание адаптера](../adr/0002-live-bridge.md) · [Исходники модификации](https://github.com/tfriedel/spire-mentor/tree/a7d5f4d2507afbc5db9a13879c9da77faff4a7e7/spire-mentor-mod)
 
-## Локальная сборка мода, если Workshop недоступен
+## Сборка расширения наблюдателя
 
 Официальная страница Workshop по ссылке upstream при проверке ответила HTTP 500. Закреплённый Spire Mentor собран с .NET SDK `9.0.321` против собственной установленной `v0.111.1`. Сборка завершилась с 18 предупреждениями исходного C# и без ошибок. BaseLib `3.4.7` скачан из официального релиза, сверена SHA‑256 архива `d28c649a3aea9ef4869050a06bfbadc4863016bcbd4c1740acc4cd07809e4bd8`. Моды установлены с согласия владельца в новые папки `mods/SpireMentor` и `mods/BaseLib`. Конфигурация мода оставляет `auto_start`, `advisor_autoplay`, `client_run_config` и `ai_partners_menu` выключенными. Версия игры и настройки Steam остались прежними. [Официальный BaseLib 3.4.7](https://github.com/Alchyr/BaseLib-StS2/releases/tag/v3.4.7)
 
-Если установка ещё не выполнена, следующие команды готовят локальные файлы без копирования в игру. Понадобится .NET SDK 9.0 и checkout, скачанный `scripts/setup.py`.
+Понадобится .NET SDK 9.0 и checkout, скачанный `scripts/setup.py`. `prepare_observer.py` проверяет чистую закреплённую ревизию, экспортирует только исходники мода и применяет [патч наблюдателя](../../patches/spire-mentor-observer.patch). Оригинальный checkout Rust остаётся чистым. Следующие команды собирают мод в отдельный каталог. Файлы игры не меняются на этом шаге.
 
 ```powershell
 $game = '<каталог игры из Steam → Управление → Просмотреть локальные файлы>'
+python scripts/prepare_observer.py
+if ($LASTEXITCODE -ne 0) { throw 'Observer source preparation failed' }
 $stage = Join-Path (Get-Location) '.local/mod-stage'
 $null = New-Item -ItemType Directory -Force $stage
 $archive = Join-Path $stage 'BaseLib.zip'
@@ -29,12 +31,20 @@ if ($LASTEXITCODE -ne 0 -or (Get-FileHash -LiteralPath $archive).Hash -ne 'd28c6
 Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $stage 'BaseLibRelease')
 $base = (Get-ChildItem -LiteralPath $stage -Filter BaseLib.dll -Recurse | Select-Object -First 1).DirectoryName
 $mentor = Join-Path $stage 'SpireMentor'
-dotnet build .local/upstream/spire-mentor-mod/SpireMentor.csproj -c Release -o $mentor "-p:STS2_GAME_DIR=$game" "-p:BaseLibDir=$base" -p:SpireMentorSkipDeploy=true -p:SpireMentorSkipAdvisorSync=true
+dotnet build .local/observer-source/spire-mentor-mod/SpireMentor.csproj -c Release -o $mentor "-p:STS2_GAME_DIR=$game" "-p:BaseLibDir=$base" -p:SpireMentorSkipDeploy=true -p:SpireMentorSkipAdvisorSync=true
 if ($LASTEXITCODE -ne 0) { throw 'Spire Mentor build failed' }
-Copy-Item -LiteralPath '.local/upstream/spire-mentor-mod/SpireMentor.json','.local/upstream/spire-mentor-mod/SpireMentor.conf.template' -Destination $mentor
+Copy-Item -LiteralPath '.local/observer-source/spire-mentor-mod/SpireMentor.json','.local/observer-source/spire-mentor-mod/SpireMentor.conf.template' -Destination $mentor
 ```
 
 При закрытой игре скопируйте только `BaseLib.dll`, `BaseLib.pck`, `BaseLib.json` из `$base` в `mods/BaseLib` и `SpireMentor.dll`, `SpireMentor.json`, `SpireMentor.conf.template` из `$mentor` в `mods/SpireMentor`. Избегайте двух копий одной модификации одновременно. В меню мода выключите автозапуск advisor backend и автобой. Workshop-подписка для этой установки не нужна.
+
+Для обновления существующей установки сохраните нынешний `mods/SpireMentor/SpireMentor.dll` вне папки `mods` и замените только этот файл при закрытой игре. Для отката верните резервный DLL после закрытия игры. Сохраняйте конфигурацию мода, BaseLib и пользовательский профиль. Для повтора подготовки в свежий каталог `prepare_observer.py` принимает `--output`.
+
+Отдельная проверка C# протокола запускается сразу после подготовки исходников. Она проверяет согласование capability, идентификаторы, возрастающий номер подтверждения, смену соединения, эпохи и видимых вариантов, уход с экрана и невозможность восстановить снятую аренду.
+
+```powershell
+dotnet run --project tests/observer/ObserverTests.csproj --artifacts-path .local/observer-tests -c Release
+```
 
 ## Ручное воспроизведение
 
@@ -42,6 +52,9 @@ Copy-Item -LiteralPath '.local/upstream/spire-mentor-mod/SpireMentor.json','.loc
 2. Запустите `live --release-info $release --json --capture-dir .local/live-captures` до выбора первого узла. Подключение должно отобразить `Connected. Waiting for Advisor observations.`.
 3. Начните одиночный стандартный забег Ironclad A0 или A10. Сравните карту с несколькими ветками, бой с несколькими целями и дубликатами карт, карточную награду со Skip. Сделайте выбор вручную. Проверьте смену `state_id` и инвалидацию старого совета после действия. Повторите для нескольких состояний каждого типа.
 4. Остановите CLI, передайте санитизированные JSON-файлы в `replay` и сравните ранжирование и `action_id` на тех же снимках. Отделите p50/p95 `receive_to_result_ms` в live-потоке от `forward_ms` и от `replay_to_result_ms`. Подсчитывайте только `status=ok` для задержки модели и отдельно сообщайте о `forced`, `blocked`, `stale`.
+5. На одном экране оставьте совет открытым 15 секунд. Проверьте повторяющиеся `confirmed` с одинаковыми `session/state_id/request_id` и возрастающим `lease_seq`, последующее `stale` при уходе. Для теста переподключения остановите CLI в активной фазе боя и запустите его снова, оставив игру открытой. Сравните новый идентификатор сессии, врагов, руку и карту с тем, что видно в игре.
+
+Для сводки используйте `python scripts/live_metrics.py <events.jsonl> --captures <каталог>`. Сводка отделяет реальные вычисления от повторной выдачи, точные повторы наблюдений от различных наград и развилок, принудительные действия и причины блокировок. Причины `blocked` относятся к наблюдавшимся запросам. Один непредусмотренный экран может дать несколько запросов, а некоторые экраны вообще не наблюдаются. Распределение блокировок по событиям не оценивает долю времени игрока без совета.
 
 Никакие игровые файлы или сырые снимки не входят в Git. Параметр `--capture-dir` сохраняет только разобранное наблюдение после allowlist. Служебная функция Copy state в самом моде может оставить сырой файл вне репозитория. Для обычной проверки используйте TCP capture.
 
@@ -78,3 +91,11 @@ Receive → result начинается после приёма полной с�
 - Live-подтверждение относится к Windows `v0.111.1` и A0. Для `v0.111.0`, A10, macOS и всех прочих сочетаний живых подтверждений в этой сессии нет. Сопоставление нескольких боевых целей и исключение мёртвых врагов проверены синтетически.
 - Пока доступны состояния с доказуемыми действиями и видимыми данными. Часть таргетируемых зелий, механик питомцев и неизвестных эффектов даёт `blocked`. При открытии overlay или уходе с экрана, о котором мод не сообщил, верхняя граница видимости прошлого совета задаётся TTL. После отключения клиент ждёт новый снимок карты для боевых рекомендаций, так как мод не включает её в combat payload.
 - Для завершения ручного покрытия продолжите Ironclad A0 на Windows по процедуре выше. Захватите как минимум второй иной набор доступных веток и бой с двумя или более активными целями. Сравните индексы с экраном, сыграйте одну карту вручную и прогоните эти же снимки через `replay`. Запишите больше разных позиций для оценки p95. [Требования Issue #3](https://github.com/MaksimOrekhov/SpireMind/issues/3)
+
+## Проверка жизненного цикла после ревью PR #4
+
+На проверенном HEAD `8c1f1b419296431d7a90d13f5e53522412898fac` штатный мод прислал реальные позиции карты `14` и `16`. После второго результата совет снялся событием `observation_ttl`. Следующего совета на той же позиции не последовало. В этой версии журнал фиксировал порядок событий, но не содержал монотонных меток времени. Настроенный срок был 1,5 с.
+
+Проверенный upstream содержит протокольный `pong`, уведомления о действиях и корреляцию запроса с позицией. При неизменных экране и сигнатуре `PollScreen` повторный запрос пропускает. Патч выдаёт подтверждения из того же игрового poll, опираясь на текущий экран, видимые варианты и эпоху. Клиент ждёт первого подтверждения перед показом и удерживает один совет, пока идут новые подтверждения. После пропуска, ухода с экрана или разрыва нужна свежая позиция. В бою новая позиция после reconnect может содержать штатный видимый граф текущего акта с последним посещённым узлом. [Upstream PollScreen](https://github.com/tfriedel/spire-mentor/blob/a7d5f4d2507afbc5db9a13879c9da77faff4a7e7/spire-mentor-mod/SimAdvisor.cs#L605)
+
+Расширение проверено локальной сборкой против `v0.111.1` и отдельным тестом C# без игровых сборок. Rust-сборка и Clippy прошли, 17 Rust-тестов выполнены, включая оба smoke с оригинальной моделью. Проверки на искусственных событиях подтверждают удержание позиции более 10 секунд, отклонение запоздавших подтверждений, снятие совета и отсутствие дополнительных запросов к модели от повторных подтверждений. Эти проверки отделены от сценария с реальной игрой.

@@ -27,6 +27,10 @@ jobs:
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - run: python scripts/setup.py --source-only
       - run: python scripts/setup.py --check-source
+      - run: python scripts/prepare_observer.py
+      - name: Test producer lease without game assemblies
+        if: runner.os == 'Windows'
+        run: dotnet run --project tests/observer/ObserverTests.csproj --artifacts-path .local/observer-tests -c Release
       - run: cargo fetch --locked
       - name: Select installed MSVC toolchain
         if: runner.os == 'Windows'

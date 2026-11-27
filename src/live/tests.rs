@@ -12,6 +12,7 @@ use super::{
     transport::{Frames, MAX_FRAME, Receive},
 };
 use crate::{contract::Context, model};
+use clap::Parser;
 
 // Hand-authored, artificial Advisor wire, not a capture from Slay the Spire 2.
 fn card(id: &str, name: &str, kind: &str, cost: u8, target: &str) -> Value {
@@ -235,6 +236,72 @@ fn synthetic_latest_state_gate_handles_races_and_ttl() {
 }
 
 #[test]
+fn synthetic_position_lease_lasts_ten_seconds_and_cannot_revive() {
+    let mut session = Session::new(7);
+    let mut latest = Latest::default();
+    let observation = base(Context::Map);
+    let position = pos(session.accept(&observation).unwrap());
+    let at = Instant::now();
+    let ttl = Duration::from_millis(1500);
+    latest.new_position(position, at);
+    assert!(!latest.confirmed);
+    let confirm = |seq, state_id| json!({"type":"spiremind_confirm","request_id":"a4","state_id":state_id,"lease_seq":seq});
+    for seq in 1..=22 {
+        let Event::Confirm(p, n) = session.accept(&confirm(seq, 11)).unwrap() else {
+            panic!("fresh confirmation expected");
+        };
+        assert_eq!(n, seq);
+        assert!(latest.confirm(p, at + Duration::from_millis(500 * n), ttl));
+        assert!(latest.pending.is_none());
+    }
+    assert!(latest.confirmed);
+    assert!(latest.valid(position, at + Duration::from_secs(11), ttl));
+    assert!(matches!(
+        session.accept(&confirm(22, 11)).unwrap(),
+        Event::Ignore
+    ));
+    assert!(matches!(
+        session.accept(&confirm(23, 10)).unwrap(),
+        Event::Ignore
+    ));
+    assert!(matches!(
+        session.accept(&json!({"type":"pong"})).unwrap(),
+        Event::Ignore
+    ));
+    assert!(!latest.confirm(position, at + Duration::from_millis(12500), ttl));
+    let close = json!({"type":"spiremind_withdraw","request_id":"a4","state_id":11});
+    assert!(matches!(session.accept(&close).unwrap(), Event::Withdraw(p) if p == position));
+    assert!(matches!(
+        Session::new(8).accept(&confirm(24, 11)).unwrap(),
+        Event::Ignore
+    ));
+    assert!(!Latest::default().confirm(position, at, ttl));
+}
+
+#[test]
+fn synthetic_live_requires_local_build_manifest() {
+    assert!(crate::Cli::try_parse_from(["spire", "live"]).is_err());
+    assert!(crate::Cli::try_parse_from(["spire", "live", "--game-version", "v0.111.1"]).is_err());
+    assert!(
+        crate::Cli::try_parse_from(["spire", "live", "--release-info", "release_info.json"])
+            .is_ok()
+    );
+}
+
+#[test]
+fn synthetic_combat_recovers_only_from_a_confirmed_visible_map() {
+    let mut fight = base(Context::Combat);
+    let mut session = Session::new(12);
+    let p = pos(session.accept(&fight).unwrap());
+    assert!(session.observe(&fight, p).is_ok());
+    fight["map"]["current"] = json!({"col":4,"row":1});
+    assert_eq!(
+        session.observe(&fight, p).err().unwrap().code,
+        "missing_visible_map"
+    );
+}
+
+#[test]
 fn synthetic_bounded_frame_reader_handles_fragments_and_eof() {
     let mut input = Cursor::new(b"abc\r\ndef\nrest");
     let mut reader = Frames::default();
@@ -281,18 +348,26 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
         output: Vec::new(),
     };
     assert_eq!(
-        live.serve(&mut duplex, 1, None).unwrap_err().code,
+        live.serve(&mut duplex, 1, "v0.111.1").unwrap_err().code,
         "non_advisor_frame"
     );
     assert!(duplex.output.is_empty());
     let mut advisor = base(Context::Map);
+    duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
+    assert_eq!(
+        live.serve(&mut duplex, 1, "v0.111.1").unwrap_err().code,
+        "lease_not_supported"
+    );
+    assert!(duplex.output.is_empty());
+    advisor["capabilities"] = json!({"spiremind_lease":1});
     advisor["advice_for"] = json!("shop");
     duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
-    live.serve(&mut duplex, 1, None).unwrap();
+    live.serve(&mut duplex, 1, "v0.111.1").unwrap();
     let reply: Value = serde_json::from_slice(&duplex.output).unwrap();
+    let supported = json!({"coach":2,"instinct":[{"character":"IRONCLAD","game_version":"v0.111.0"},{"character":"IRONCLAD","game_version":"v0.111.1"}],"spiremind_lease":1});
     assert_eq!(
         reply,
-        json!({"action":"advice","request_id":"a4","state_id":11,"advice":{"hand_back":"SpireMind terminal only"},"capabilities":{"coach":2,"instinct":[]}})
+        json!({"action":"advice","request_id":"a4","state_id":11,"advice":{"hand_back":"SpireMind terminal only"},"capabilities":supported})
     );
     let ack = serde_json::to_value(Ack::for_position(Position {
         session: 1,
@@ -302,8 +377,18 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     .unwrap();
     assert_eq!(
         ack,
-        json!({"action":"advice","request_id":"a3","state_id":42,"advice":{"hand_back":"SpireMind terminal only"},"capabilities":{"coach":2,"instinct":[]}})
+        json!({"action":"advice","request_id":"a3","state_id":42,"advice":{"hand_back":"SpireMind terminal only"},"capabilities":supported})
     );
+    advisor["advice_for"] = json!("map_select");
+    duplex.output.clear();
+    duplex.input = Cursor::new(format!("{advisor}\n{{\"type\":\"spiremind_confirm\",\"request_id\":\"a4\",\"state_id\":11,\"lease_seq\":1}}\n{{\"type\":\"spiremind_withdraw\",\"request_id\":\"a4\",\"state_id\":11}}\n").into_bytes());
+    live.serve(&mut duplex, 2, "v0.111.1").unwrap();
+    assert_eq!(
+        duplex.output.iter().filter(|&&byte| byte == b'\n').count(),
+        1
+    );
+    let latest = live.latest.lock().unwrap();
+    assert!(latest.position.is_none() && latest.pending.is_none() && !latest.confirmed);
 }
 
 #[test]

@@ -29,7 +29,14 @@ struct HandBack {
 #[derive(Serialize)]
 struct Capabilities {
     coach: u8,
-    instinct: [&'static str; 0],
+    instinct: [InstinctTarget; 2],
+    spiremind_lease: u8,
+}
+
+#[derive(Serialize)]
+struct InstinctTarget {
+    character: &'static str,
+    game_version: &'static str,
 }
 
 impl Ack {
@@ -43,7 +50,11 @@ impl Ack {
             },
             capabilities: Capabilities {
                 coach: 2,
-                instinct: [],
+                instinct: ["v0.111.0", "v0.111.1"].map(|game_version| InstinctTarget {
+                    character: "IRONCLAD",
+                    game_version,
+                }),
+                spiremind_lease: 1,
             },
         }
     }
@@ -64,6 +75,8 @@ fn request_id(raw: &Value, key: &str) -> Result<u64> {
 
 pub enum Event {
     Observation(Position),
+    Confirm(Position, u64),
+    Withdraw(Position),
     Invalidate(&'static str),
     Ignore,
 }
@@ -85,6 +98,7 @@ pub struct Session {
     last: Option<Position>,
     map: Option<MapPosition>,
     choice: Option<MapChoice>,
+    lease_seq: u64,
 }
 
 impl Session {
@@ -94,6 +108,7 @@ impl Session {
             last: None,
             map: None,
             choice: None,
+            lease_seq: 0,
         }
     }
 
@@ -113,20 +128,28 @@ impl Session {
             }
             // The producer's heartbeat carries no new position.
             "pong" => Ok(Event::Ignore),
+            "spiremind_confirm" | "spiremind_withdraw" => {
+                let position = self.wire_position(raw)?;
+                if self.last != Some(position) {
+                    return Ok(Event::Ignore);
+                }
+                if raw["type"] == "spiremind_withdraw" {
+                    return Ok(Event::Withdraw(position));
+                }
+                let seq = number(raw, "lease_seq", i64::MAX as u64)?;
+                if seq <= self.lease_seq {
+                    return Ok(Event::Ignore);
+                }
+                self.lease_seq = seq;
+                Ok(Event::Confirm(position, seq))
+            }
             // Vanilla room entry saves before the Advisor's correlated map
             // pick arrives. Drop the display, keeping that pending pick.
             "snapshot_saved" if raw.get("request_id").is_none() => {
                 Ok(Event::Invalidate("snapshot_saved"))
             }
             "advice_request" => {
-                let current = Position {
-                    session: self.id,
-                    state_id: number(raw, "state_id", i64::MAX as u64)?,
-                    request_id: request_id(raw, "request_id")?,
-                };
-                if current.state_id == 0 {
-                    return Err(schema("state_id"));
-                }
+                let current = self.wire_position(raw)?;
                 if let Some(last) = self.last {
                     if last == current {
                         return Ok(Event::Ignore);
@@ -136,6 +159,7 @@ impl Session {
                     }
                 }
                 self.last = Some(current);
+                self.lease_seq = 0;
                 Ok(Event::Observation(current))
             }
             // Reject the autopilot lane (and everything unrecognized) before
@@ -145,6 +169,18 @@ impl Session {
                 "This connection is not on the read-only Advisor lane",
             )),
         }
+    }
+
+    fn wire_position(&self, raw: &Value) -> Result<Position> {
+        let state_id = number(raw, "state_id", i64::MAX as u64)?;
+        if state_id == 0 {
+            return Err(schema("state_id"));
+        }
+        Ok(Position {
+            session: self.id,
+            state_id,
+            request_id: request_id(raw, "request_id")?,
+        })
     }
 
     pub fn observe(&mut self, raw: &Value, position: Position) -> Result<Observation> {
@@ -167,6 +203,15 @@ impl Session {
             self.choice = None;
         }
         if !b["map"].is_null() {
+            if o.context == Context::Combat
+                && (b["map"]["current"].is_null()
+                    || list(&b["map"], "visited", 64)?.last() != Some(&b["map"]["current"]))
+            {
+                return Err(Failure::new(
+                    "missing_visible_map",
+                    "The combat observation does not identify the last visited map point",
+                ));
+            }
             self.map = Some(MapPosition {
                 version,
                 act,
