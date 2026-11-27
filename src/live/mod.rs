@@ -1,0 +1,485 @@
+mod engine;
+mod observation;
+mod session;
+#[cfg(test)]
+mod tests;
+mod transport;
+
+use std::{
+    fs::{self, File, OpenOptions},
+    io::{self, IsTerminal, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use serde_json::{Value, json};
+use sts2_e2e::net::E2eNet;
+
+use crate::{Failure, Result, model};
+
+use observation::Observation;
+use session::{Ack, Event, Position, Session};
+use transport::{Frames, MAX_FRAME, Receive};
+
+const READ_POLL: Duration = Duration::from_millis(50);
+const RECONNECT: Duration = Duration::from_millis(500);
+
+struct Job {
+    position: Position,
+    received: Instant,
+    observation: Observation,
+}
+
+#[derive(Default)]
+struct Latest {
+    position: Option<Position>,
+    received: Option<Instant>,
+    display: bool,
+    pending: Option<Job>,
+}
+
+impl Latest {
+    fn new_position(&mut self, p: Position, t: Instant) {
+        *self = Self {
+            position: Some(p),
+            received: Some(t),
+            ..Self::default()
+        };
+    }
+    fn valid(&self, p: Position, now: Instant, ttl: Duration) -> bool {
+        self.position == Some(p)
+            && self
+                .received
+                .is_some_and(|t| now.saturating_duration_since(t) < ttl)
+    }
+}
+
+struct Terminal {
+    json: bool,
+}
+
+impl Terminal {
+    fn emit(&self, event: &Value) {
+        let mut out = io::stdout().lock();
+        if self.json {
+            let _ = writeln!(out, "{event}");
+        } else {
+            let status = event["status"].as_str().unwrap_or("unknown");
+            let _ = writeln!(out, "\x1b[2J\x1b[HSpireMind | {status}");
+            if let Some(p) = event.get("position") {
+                let _ = writeln!(
+                    out,
+                    "State {} / session {} | {} | {} | Ironclad A{}",
+                    p["state_id"],
+                    p["session"],
+                    event["context"].as_str().unwrap_or(""),
+                    event["game_version"].as_str().unwrap_or(""),
+                    event["ascension"]
+                );
+            }
+            if let Some(reason) = event["error"]["message"]
+                .as_str()
+                .or_else(|| event["reason"].as_str())
+            {
+                let _ = writeln!(out, "{reason}");
+            }
+            let actions = event["legal_actions"].as_array();
+            let row =
+                |id: &Value| actions.and_then(|a| id.as_u64().and_then(|i| a.get(i as usize)));
+            if let Some(id) = event.get("forced_action_id")
+                && let Some(a) = row(id)
+            {
+                let _ = writeln!(out, "Only legal action: {}", label(&a["action"]));
+            }
+            if let Some(ranked) = event["recommendations"].as_array() {
+                for (i, recommendation) in ranked.iter().take(5).enumerate() {
+                    if let Some(a) = row(&recommendation["representative_action_id"]) {
+                        let score =
+                            recommendation["policy_probability"].as_f64().unwrap_or(0.0) * 100.0;
+                        let _ = writeln!(
+                            out,
+                            "{}. {}  ({score:.1}% policy)",
+                            i + 1,
+                            label(&a["action"])
+                        );
+                    }
+                }
+            }
+            if let Some(ms) = event["receive_to_result_ms"].as_f64() {
+                let forward = event["forward_ms"]
+                    .as_f64()
+                    .map_or_else(|| "—".to_owned(), |v| format!("{v:.2} ms"));
+                let _ = writeln!(out, "\nReceive to result {ms:.2} ms | forward {forward}");
+            }
+        }
+        let _ = out.flush();
+    }
+}
+
+fn label(a: &Value) -> String {
+    let visible = match a["kind"].as_str() {
+        Some("play") => {
+            let mut text = format!(
+                "{} (hand {}, cost {})",
+                a["card"]["name"].as_str().unwrap_or("?"),
+                a["card"]["hand_index"],
+                a["card"]["effective_cost"]
+            );
+            if let Some(name) = a["target"]["name"].as_str() {
+                text.push_str(&format!(" → {name} (enemy {})", a["target"]["enemy_index"]));
+            }
+            text
+        }
+        Some("reward_card") => format!(
+            "{} (offer {})",
+            a["name"].as_str().unwrap_or("?"),
+            a["offer_index"]
+        ),
+        Some("potion") => format!(
+            "{} (potion {})",
+            a["name"].as_str().unwrap_or("?"),
+            a["slot"]
+        ),
+        Some("move") => format!(
+            "{} (row {}, col {})",
+            a["room_type"].as_str().unwrap_or("?"),
+            a["row"],
+            a["col"]
+        ),
+        Some("end_turn") => "End turn".to_owned(),
+        Some("skip") => "Skip".to_owned(),
+        _ => "Unknown action".to_owned(),
+    };
+    visible.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn decorate(mut event: Value, obs: &Observation, p: Position, source: &str) -> Value {
+    event["schema_version"] = json!(1);
+    event["source"] = json!(source);
+    event["position"] = json!(p);
+    event["context"] = json!(obs.context);
+    event["game_version"] = obs.board["game_version"].clone();
+    event["mod_version"] = obs.board["mod_version"].clone();
+    event["character"] = obs.board["run_state"]["character"].clone();
+    event["ascension"] = obs.board["run_state"]["ascension"].clone();
+    event["model"] = json!(model::pin());
+    event["upstream_revision"] = json!(model::REVISION);
+    event["observation"] = json!(model::OBSERVATION);
+    event
+}
+
+fn blocked(e: Failure) -> Value {
+    json!({"schema_version":1,"status":"blocked","error":e})
+}
+
+fn persist(dir: &Path, job: &Job) -> io::Result<()> {
+    let path = dir.join(format!(
+        "advisor-{}-{}-{}.json",
+        std::process::id(),
+        job.position.session,
+        job.position.state_id
+    ));
+    let mut file = OpenOptions::new().create_new(true).write(true).open(path)?;
+    serde_json::to_writer(&mut file, &job.observation.board)?;
+    file.write_all(b"\n")
+}
+
+struct Live {
+    latest: Mutex<Latest>,
+    wake: Condvar,
+    terminal: Terminal,
+    ttl: Duration,
+}
+
+impl Live {
+    fn worker(&self, net: E2eNet, capture: Option<PathBuf>) {
+        loop {
+            let job = {
+                let state = self.latest.lock().unwrap();
+                let mut guard = self
+                    .wake
+                    .wait_while(state, |s| s.pending.is_none())
+                    .unwrap();
+                guard.pending.take().unwrap()
+            };
+            let value = engine::advise(&net, &job.observation).unwrap_or_else(blocked);
+            let mut result = decorate(value, &job.observation, job.position, "advisor_tcp");
+            {
+                let mut guard = self.latest.lock().unwrap();
+                let now = Instant::now();
+                if guard.valid(job.position, now, self.ttl) {
+                    result["receive_to_result_ms"] =
+                        json!(now.duration_since(job.received).as_secs_f64() * 1000.0);
+                    self.terminal.emit(&result);
+                    guard.display = true;
+                }
+            }
+            if let Some(dir) = capture.as_deref()
+                && persist(dir, &job).is_err()
+            {
+                eprintln!("SpireMind: could not save sanitized observation");
+            }
+        }
+    }
+
+    fn invalidate(&self, reason: &'static str) {
+        let mut latest = self.latest.lock().unwrap();
+        let position = latest.position;
+        *latest = Latest::default();
+        self.terminal.emit(
+            &json!({"schema_version":1,"status":"stale","reason":reason,"position":position}),
+        );
+    }
+
+    fn expire(&self) {
+        let mut l = self.latest.lock().unwrap();
+        if l.position.is_some() && l.received.is_some_and(|t| t.elapsed() >= self.ttl) {
+            let position = l.position;
+            *l = Latest::default();
+            self.terminal.emit(&json!({"schema_version":1,"status":"stale","reason":"observation_ttl","position":position}));
+        }
+    }
+
+    fn begin(&self, p: Position, t: Instant) {
+        let mut l = self.latest.lock().unwrap();
+        let previous = l.position.filter(|_| l.display);
+        l.new_position(p, t);
+        if previous.is_some() {
+            self.terminal.emit(&json!({"schema_version":1,"status":"stale","reason":"new_observation","position":previous}));
+        }
+    }
+
+    fn queue(&self, job: Job) {
+        let mut l = self.latest.lock().unwrap();
+        if l.valid(job.position, Instant::now(), self.ttl) {
+            l.pending = Some(job);
+            self.wake.notify_one();
+        }
+    }
+
+    fn connection(
+        &self,
+        mut socket: TcpStream,
+        id: u64,
+        expected_build: Option<&str>,
+    ) -> Result<()> {
+        socket
+            .set_read_timeout(Some(READ_POLL))
+            .map_err(|_| link_error())?;
+        socket
+            .set_write_timeout(Some(Duration::from_millis(100)))
+            .map_err(|_| link_error())?;
+        socket.set_nodelay(true).map_err(|_| link_error())?;
+        self.serve(&mut socket, id, expected_build)
+    }
+
+    fn serve(
+        &self,
+        socket: &mut (impl Read + Write),
+        id: u64,
+        expected_build: Option<&str>,
+    ) -> Result<()> {
+        self.terminal.emit(&json!({"schema_version":1,"status":"waiting","reason":"Connected. Waiting for Advisor observations."}));
+        let mut frames = Frames::default();
+        let mut session = Session::new(id);
+        loop {
+            self.expire();
+            match frames.read(socket).map_err(|_| link_error())? {
+                Receive::Idle => continue,
+                Receive::Eof => return Ok(()),
+                Receive::Frame(bytes, at) => {
+                    let raw: Value = serde_json::from_slice(&bytes)
+                        .map_err(|_| observation::schema("JSONL frame"))?;
+                    drop(bytes);
+                    match session.accept(&raw)? {
+                        Event::Ignore => {}
+                        Event::Invalidate(reason) => self.invalidate(reason),
+                        Event::Observation(p) => {
+                            self.begin(p, at);
+                            let actual = observation::string(&raw, "game_version")?;
+                            observation::live_build(actual)?;
+                            if expected_build.is_some_and(|v| v != actual)
+                                || raw["mod_version"] != observation::MOD
+                                || raw["player_count"] != 1
+                            {
+                                return Err(Failure::new(
+                                    "producer_mismatch",
+                                    "Version, mod or player count differs from the admitted producer",
+                                ));
+                            }
+                            // A screen request remains in flight without this reply.
+                            // The Ack has no best, options, gameplay fields or score.
+                            let mut ack = serde_json::to_vec(&Ack::for_position(p))
+                                .expect("serializable fixed ack");
+                            ack.push(b'\n');
+                            socket.write_all(&ack).map_err(|_| link_error())?;
+                            let obs = session.observe(&raw, p);
+                            drop(raw);
+                            match obs {
+                                Ok(observation) => self.queue(Job {
+                                    position: p,
+                                    received: at,
+                                    observation,
+                                }),
+                                Err(e) => {
+                                    let mut event = blocked(e);
+                                    event["position"] = json!(p);
+                                    self.terminal.emit(&event);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn link_error() -> Failure {
+    Failure::new(
+        "transport",
+        "Advisor connection ended or exceeded a frame/IO limit",
+    )
+}
+
+pub fn run(
+    net: E2eNet,
+    port: u16,
+    ttl_ms: u64,
+    json_output: bool,
+    capture: Option<PathBuf>,
+    expected_build: Option<&str>,
+) -> Result<()> {
+    if let Some(path) = capture.as_deref() {
+        fs::create_dir_all(path)
+            .map_err(|_| Failure::new("capture_io", "Cannot create capture directory"))?;
+    }
+    let live = Arc::new(Live {
+        latest: Mutex::new(Latest::default()),
+        wake: Condvar::new(),
+        terminal: Terminal {
+            json: json_output || !io::stdout().is_terminal(),
+        },
+        ttl: Duration::from_millis(ttl_ms),
+    });
+    let worker = Arc::clone(&live);
+    thread::Builder::new()
+        .name("instinct-live".into())
+        .spawn(move || worker.worker(net, capture))
+        .map_err(|_| Failure::new("worker", "Cannot start inference worker"))?;
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    live.terminal.emit(&json!({"schema_version":1,"status":"waiting","reason":format!("Waiting for Spire Mentor on {address}")}));
+    let mut session_id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    loop {
+        if let Ok(socket) = TcpStream::connect_timeout(&address, RECONNECT) {
+            session_id += 1;
+            let reason = live.connection(socket, session_id, expected_build).err();
+            live.invalidate("disconnect");
+            if let Some(error) = reason {
+                live.terminal.emit(&blocked(error));
+            }
+        }
+        thread::sleep(RECONNECT);
+    }
+}
+
+fn read_capture(path: &Path) -> Result<Value> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|f| f.take(MAX_FRAME as u64 + 1).read_to_end(&mut bytes))
+        .map_err(|_| Failure::new("capture_io", "Cannot read capture file"))?;
+    if bytes.len() > MAX_FRAME {
+        return Err(observation::schema("bounded capture size"));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| observation::schema("capture JSON"))
+}
+
+pub use observation::live_build as check_version;
+
+pub fn release_build(path: &Path) -> Result<String> {
+    let value = read_capture(path)?;
+    let version = observation::string(&value, "version")?;
+    check_version(version)?;
+    let commit = observation::string(&value, "commit")?;
+    if !matches!(
+        (version, commit),
+        ("v0.111.0", "41cef1ea") | ("v0.111.1", "cc1f9462")
+    ) {
+        return Err(Failure::new(
+            "incompatible_game_version",
+            "Unverified release_info.json version and commit pair",
+        ));
+    }
+    Ok(version.to_owned())
+}
+
+pub fn sanitize_file(input: &Path, output: &Path) -> Result<Value> {
+    let raw = read_capture(input)?;
+    let o = observation::sanitize(&raw, observation::context(&raw)?)?;
+    if o.board["map"].is_null() {
+        return Err(Failure::new(
+            "missing_visible_map",
+            "Capture must contain a visible map",
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(output)
+        .map_err(|_| Failure::new("capture_io", "Cannot create new sanitized capture file"))?;
+    serde_json::to_writer(&mut file, &o.board)
+        .map_err(|_| Failure::new("capture_io", "Cannot save sanitized capture"))?;
+    Ok(
+        json!({"schema_version":1,"status":"sanitized","context":o.context,"state_id":o.board["state_id"]}),
+    )
+}
+
+pub fn replay(net: &E2eNet, files: &[PathBuf]) -> Result<(Value, bool)> {
+    let mut ok = true;
+    let mut times = Vec::new();
+    let mut results = Vec::new();
+    for (index, path) in files.iter().enumerate() {
+        let raw = read_capture(path)?;
+        let at = Instant::now();
+        let obs = observation::sanitize(&raw, observation::context(&raw)?)?;
+        let p = Position {
+            session: 0,
+            state_id: observation::number(&obs.board, "state_id", i64::MAX as u64)?,
+            request_id: 0,
+        };
+        let mut value = decorate(
+            engine::advise(net, &obs).unwrap_or_else(|e| {
+                ok = false;
+                blocked(e)
+            }),
+            &obs,
+            p,
+            "replay",
+        );
+        let ms = at.elapsed().as_secs_f64() * 1000.0;
+        if value["status"] == "ok" {
+            times.push(ms);
+        }
+        value["replay_to_result_ms"] = json!(ms);
+        value["replay_index"] = json!(index);
+        results.push(value);
+    }
+    times.sort_by(f64::total_cmp);
+    let percent = |p: usize| {
+        if times.is_empty() {
+            None
+        } else {
+            Some(times[(p * times.len()).div_ceil(100) - 1])
+        }
+    };
+    Ok((
+        json!({"schema_version":1,"source":"replay","status":if ok{"ok"}else{"partial"},"scored_latency":{"count":times.len(),"p50_ms":percent(50),"p95_ms":percent(95)},"observations":results}),
+        ok,
+    ))
+}

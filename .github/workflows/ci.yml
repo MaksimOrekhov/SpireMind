@@ -1,4 +1,4 @@
-name: SM-01 checks
+name: SpireMind checks
 
 on:
   push:
@@ -26,10 +26,21 @@ jobs:
           python-version: '3.12'
       - run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
       - run: python scripts/setup.py --source-only
+      - run: python scripts/setup.py --check-source
+      - run: cargo fetch --locked
+      - name: Select installed MSVC toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC build tools not found' }
+          $lines = cmd.exe /d /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >NUL && set"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $lines | Where-Object { $_ -match '^(VCINSTALLDIR|VCToolsInstallDir|INCLUDE|LIB|LIBPATH|PATH)=' } | Add-Content -Encoding utf8 $env:GITHUB_ENV
       - run: cargo fmt --check
-      - run: cargo clippy --release --locked --all-targets -- -D warnings
-      - run: cargo build --release --locked
-      - run: cargo test --release --locked
+      - run: cargo clippy --release --locked --offline --all-targets -- -D warnings
+      - run: cargo build --release --locked --offline
+      - run: cargo test --release --locked --offline
 
   model-smoke:
     name: Original Instinct CPU smoke (Windows)
@@ -44,4 +55,12 @@ jobs:
           python-version: '3.12'
       - run: rustup toolchain install 1.99.1 --profile minimal
       - run: python scripts/setup.py
-      - run: cargo test --release --locked model_smoke -- --ignored --nocapture
+      - run: python scripts/setup.py --check-source
+      - run: cargo fetch --locked
+      - name: Real model smoke with MSVC
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'MSVC build tools not found' }
+          cmd.exe /d /c "call `"$vs\VC\Auxiliary\Build\vcvars64.bat`" >NUL && cargo test --release --locked --offline model_smoke -- --ignored --nocapture"
+          exit $LASTEXITCODE
