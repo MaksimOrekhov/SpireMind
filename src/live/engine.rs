@@ -163,10 +163,19 @@ fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action,
                     continue;
                 }
                 use_potions = true;
+                // The session only admits one player. An AnyPlayer potion
+                // with no target picker can only address that player.
                 if p["requires_target"] == true
                     || !matches!(
                         p["target_type"].as_str(),
-                        Some("None" | "Self" | "AllEnemies" | "RandomEnemy" | "TargetedNoCreature")
+                        Some(
+                            "None"
+                                | "Self"
+                                | "AnyPlayer"
+                                | "AllEnemies"
+                                | "RandomEnemy"
+                                | "TargetedNoCreature"
+                        )
                     )
                 {
                     return Err(coverage(

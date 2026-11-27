@@ -471,6 +471,28 @@ fn live_model_smoke_synthetic_wire_real_instinct() {
         result
     };
     assert_eq!(infer(&correct), infer(&hidden));
+    let mut potion = base(Context::Combat);
+    potion["potions"][0] = json!({"slot":0,"empty":false,"id":"SKILL_POTION","name":"Skill Potion","usage":"CombatOnly","target_type":"AnyPlayer","requires_target":false,"can_use":true});
+    potion["run_state"]["potions"] = potion["potions"].clone();
+    potion["available_actions"] = json!(["PLAY", "END_TURN", "POTION"]);
+    let result = engine::advise(&net, &sanitize(&potion, Context::Combat).unwrap()).unwrap();
+    assert!(
+        result["legal_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| {
+                row["action"]["kind"] == "potion" && row["action"]["id"] == "SKILL_POTION"
+            })
+    );
+    potion["potions"][0]["requires_target"] = json!(true);
+    potion["run_state"]["potions"] = potion["potions"].clone();
+    assert_eq!(
+        engine::advise(&net, &sanitize(&potion, Context::Combat).unwrap())
+            .unwrap_err()
+            .code,
+        "action_coverage"
+    );
     let mut entrance = base(Context::Map);
     entrance["map"]["current"] = Value::Null;
     assert_eq!(

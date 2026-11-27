@@ -64,6 +64,7 @@ def summarize(events, captures):
     stale_reasons = Counter()
     observation_ids = defaultdict(Counter)
     decisions = defaultdict(set)
+    inferred = defaultdict(set)
     forwards = defaultdict(list)
     receive = defaultdict(list)
     published = {}
@@ -88,6 +89,7 @@ def summarize(events, captures):
             if status == "ok":
                 contexts[context]["inference" if "forward_ms" in event else "cached_ok"] += 1
                 if "forward_ms" in event:
+                    inferred[context].add(event["observation_id"])
                     forwards[context].append(event["forward_ms"])
                     receive[context].append(event["receive_to_result_ms"])
         elif status == "confirmed" and key in published:
@@ -102,6 +104,8 @@ def summarize(events, captures):
             "unique_observations_ok_or_forced": len(fingerprints),
             "duplicate_observations_ok_or_forced": sum(fingerprints.values()) - len(fingerprints),
             "distinct_decisions_ok_or_forced": len(decisions[context]),
+            "unique_scored_observations": len(inferred[context]),
+            "duplicate_scored_observations": len(forwards[context]) - len(inferred[context]),
             "receive_to_result": latency(receive[context]),
             "forward": latency(forwards[context]),
         }
@@ -111,6 +115,7 @@ def summarize(events, captures):
         "blocked_reasons": dict(reasons),
         "stale_reasons": dict(stale_reasons),
         "contexts": detail,
+        "unique_scored_observations": sum(map(len, inferred.values())),
         "receive_to_result": latency([v for ctx in receive.values() for v in ctx]),
         "forward": latency([v for ctx in forwards.values() for v in ctx]),
         "longest_confirmed_display": (
