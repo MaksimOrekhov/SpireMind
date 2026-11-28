@@ -59,16 +59,26 @@ enum Mode {
         runs: u8,
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
+        /// Apply live profile v2 to native simulator combat decisions.
+        #[arg(long)]
+        combat_v2: bool,
     },
     /// Compare simulator-derived public combat positions and original Instinct.
     Compatibility {
         #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
         runs: u8,
-        #[arg(long, default_value_t = 160, value_parser = clap::value_parser!(u32).range(10..=1500))]
+        #[arg(long, default_value_t = 180, value_parser = clap::value_parser!(u32).range(10..=1500))]
         steps_per_run: u32,
         /// Compare reconstructions without loading model weights.
         #[arg(long)]
         structural_only: bool,
+    },
+    /// Independently sample policy-guided Ironclad A0 campaigns.
+    HeldOut {
+        #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(1..=16))]
+        runs: u8,
+        #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u32).range(10..=4000))]
+        steps_per_run: u32,
     },
     /// List observation compatibility for the pinned upstream power registry.
     PowerMatrix,
@@ -133,7 +143,10 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
     }
     if matches!(
         cli.command,
-        Mode::Recommend { .. } | Mode::Benchmark { .. } | Mode::Compatibility { .. }
+        Mode::Recommend { .. }
+            | Mode::Benchmark { .. }
+            | Mode::Compatibility { .. }
+            | Mode::HeldOut { .. }
     ) {
         model::check_build(cli.game_version.as_deref().unwrap_or(BUILD.as_str()))?;
     }
@@ -151,13 +164,26 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
         Mode::Benchmark {
             runs,
             timeout_seconds,
-        } => Ok(simulation::benchmark(&net, runs, timeout_seconds)),
+            combat_v2,
+        } => Ok(simulation::benchmark(
+            &net,
+            runs,
+            timeout_seconds,
+            combat_v2,
+        )),
         Mode::Compatibility {
             runs,
             steps_per_run,
             ..
         } => Ok((
             live::compatibility::run(Some(&net), runs, steps_per_run as usize)?,
+            true,
+        )),
+        Mode::HeldOut {
+            runs,
+            steps_per_run,
+        } => Ok((
+            live::compatibility::held_out(&net, runs, steps_per_run as usize)?,
             true,
         )),
         Mode::Live {

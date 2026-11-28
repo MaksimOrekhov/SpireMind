@@ -65,4 +65,6 @@ python scripts/live_metrics.py .local/live-captures/events.jsonl --captures .loc
 
 Для разбора блокировок добавьте к запуску `live` параметр `--blocked-corpus .local/blocked-a0`. Укажите новый каталог. Команда `python scripts/coverage_panel.py blockers .local/blocked-a0` ранжирует санитизированные причины отказов. ID эффекта указан, если игра подтвердила его видимость и он найден в закреплённом реестре. `spiremind compatibility` запускает отдельный офлайн-набор с исходным движком и весами Instinct. [Таблица эффектов и результаты](docs/research/combat-compatibility.md)
 
+`spiremind held-out` проверяет позиции из независимых кампаний, которые проходит Instinct. Для боёв с Glam, Vigorous, Swift, Sown и зельями с выбором противника сборка наблюдателя передаёт дополнительные признаки из игрового интерфейса. [Аудит проектора и методика проверки](docs/research/combat-projection-audit.md)
+
 Остановите CLI через `Ctrl+C`. Чтобы отключить мод, переведите его в режим **Off** или выключите в меню модов. Для отката ручной установки закройте игру и вынесите папку `mods/SpireMentor` из каталога игры. `mods/BaseLib` оставьте, если она нужна другим модам. Для Workshop-установки отпишитесь от Spire Mentor. [ADR live bridge](docs/adr/0002-live-bridge.md)

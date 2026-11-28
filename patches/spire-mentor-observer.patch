@@ -212,7 +212,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
      /// recap / autopsy records.</summary>
 -    private static Dictionary<string, object> ModCapabilities() => new() { ["coach"] = 2 };
 +    private static Dictionary<string, object> ModCapabilities() =>
-+        new() { ["coach"] = 2, ["spiremind_lease"] = 1, ["spiremind_power_visibility"] = 1 };
++        new() { ["coach"] = 2, ["spiremind_lease"] = 1, ["spiremind_power_visibility"] = 1, ["spiremind_card_status"] = 1, ["spiremind_potion_targets"] = 1 };
 +
 +    private static string? ObserverKey(SimScreenDecision screen)
 +    {
@@ -289,7 +289,40 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
 diff --git a/spire-mentor-mod/SimStateExtractor.cs b/spire-mentor-mod/SimStateExtractor.cs
 --- a/spire-mentor-mod/SimStateExtractor.cs
 +++ b/spire-mentor-mod/SimStateExtractor.cs
-@@ -1336,6 +1336,7 @@
+@@ -480,5 +480,9 @@
+             int enchAmount = 0;
+             try { enchAmount = enchantment.Amount; } catch { }
+             if (enchAmount != 0)
+                 data["enchantment_amount"] = enchAmount;
++            // The same state NCard uses to draw the enchantment tab.
++            // Only enchantments with an audited Rust mapping opt in.
++            if (enchantment.Id.Entry is "GLAM" or "VIGOROUS" or "SOWN" or "SWIFT")
++                data["observer_enchantment_status"] = SafeString(() => enchantment.Status.ToString());
+         }
+@@ -1082,5 +1086,14 @@
+         try
+         {
+             TargetType targetType = potion.TargetType;
++            IReadOnlyList<Creature>? enemies = potion.Owner?.Creature?.CombatState?.Enemies;
++            List<int>? validTargets = null;
++            if (targetType == TargetType.AnyEnemy && enemies != null)
++            {
++                validTargets = new List<int>();
++                for (int i = 0; i < enemies.Count; i++)
++                    if (enemies[i].IsHittable && potion.IsValidTarget(enemies[i]))
++                        validTargets.Add(i);
++            }
+             return new Dictionary<string, object?>
+             {
+@@ -1095,6 +1108,7 @@
+                 ["can_use"] = potion.Usage != PotionUsage.Automatic,
+                 ["target_type"] = targetType.ToString(),
+                 ["requires_target"] = targetType == TargetType.AnyEnemy,
++                ["valid_target_indices"] = validTargets,
+             };
+         }
+         catch (Exception ex)
+@@ -1336,6 +1350,7 @@
              var d = new Dictionary<string, object?>
              {
                  ["id"] = power.Id.Entry,

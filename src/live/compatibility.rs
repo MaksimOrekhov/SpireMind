@@ -2,11 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sts2_core::{MonsterKind, PowerKind, run_manager::RunManager};
+use sts2_core::{MonsterKind, PowerKind, cards::VarKey, run_manager::RunManager};
 use sts2_e2e::{
     build::Scope,
     env::{ApplyKind, Driver, Next, new_run_at},
     net::{E2eNet, PolicyRow, argmax},
+    tokens::TokCache,
 };
 use sts2_wire::emit;
 
@@ -56,7 +57,9 @@ pub fn power_matrix() -> Value {
 
 #[derive(Default)]
 struct Report {
-    seen: BTreeSet<String>,
+    seen: BTreeMap<String, BTreeSet<String>>,
+    semantic_positions: usize,
+    public_collisions: usize,
     duplicates: usize,
     outcomes: BTreeMap<&'static str, usize>,
     blocked: BTreeMap<String, usize>,
@@ -76,6 +79,14 @@ struct Report {
     checks: BTreeMap<&'static str, usize>,
     max_logit_abs_delta: f32,
     token_diff: BTreeMap<String, usize>,
+    positions_by_act: BTreeMap<u8, usize>,
+    positions_by_room: BTreeMap<String, usize>,
+    private_card_variables: BTreeMap<String, usize>,
+    legacy_card_marker_positions: usize,
+    reevaluated_legacy_card_blocks: BTreeMap<String, usize>,
+    importer_warnings: BTreeMap<String, usize>,
+    first_failure_by_encounter: BTreeMap<String, BTreeMap<String, usize>>,
+    invariance_strata: BTreeSet<(u8, bool, bool, bool)>,
 }
 
 fn rows(value: &Value) -> &[Value] {
@@ -140,6 +151,92 @@ fn comparable_board(mut raw: Value) -> Value {
             .remove("combat_id");
     }
     raw
+}
+
+fn oracle_signature(rm: &RunManager, actions: &Value) -> Result<String> {
+    let combat = rm
+        .combat
+        .as_ref()
+        .ok_or_else(|| mismatch("sim_projection", "No oracle combat"))?;
+    let combat = sts2_e2e::snapshot::belief_view(combat);
+    let wire =
+        sts2_e2e::snapshot::state_dict(&combat).map_err(|e| mismatch("sim_projection", &e))?;
+    // The snapshot plus upstream previews cover the policy-visible combat
+    // distinctions. Scratch values are used only for the offline audit,
+    // making ties conservative even if a previous encoder ignored a field.
+    let snap = sts2_e2e::snapshot::honest_snapshot(&combat, sts2_e2e::env::fight_room(rm))
+        .map_err(|e| mismatch("sim_projection", &e))?;
+    let live = sts2_e2e::snapshot::live_snapshot(&snap, &combat, &wire);
+    let scratch = ["hand", "draw_pile", "discard_pile", "exhaust_pile"].map(|pile| {
+        let mut cards = rows(&wire["deck"][pile])
+            .iter()
+            .map(|c| json!([c["id"], c["combat_vars"], c["cost_mods"]]))
+            .collect::<Vec<_>>();
+        if pile == "draw_pile" {
+            cards.sort_by_cached_key(Value::to_string);
+        }
+        cards
+    });
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(json!([actions, live, scratch]).to_string())
+    ))
+}
+
+fn record_position(report: &mut Report, public: String, semantic: String) -> bool {
+    let signatures = report.seen.entry(public).or_default();
+    let new_public = signatures.is_empty();
+    if !signatures.insert(semantic) {
+        report.duplicates += 1;
+        return false;
+    }
+    report.semantic_positions += 1;
+    report.public_collisions += usize::from(!new_public);
+    true
+}
+
+// A partial PoC: build the policy class partition from the public dialect
+// and an already independently verified action list. No combat graft is
+// needed for this substage. A full row still needs current preview inputs.
+fn direct_classes(
+    obs: &observation::Observation,
+    actions: &[Value],
+    ascension: u8,
+) -> Result<(Vec<usize>, Vec<Vec<usize>>)> {
+    use sts2_e2e::contracts::{classes_from_keys, combat_class_keys};
+    let (wire, warnings) = engine::combat_wire(&obs.board, ascension)
+        .map_err(|_| mismatch("direct_classes", "Public card spec translation failed"))?;
+    if !warnings.is_empty() {
+        return Err(mismatch(
+            "direct_classes",
+            "Public card spec translation reported warnings",
+        ));
+    }
+    let keys = combat_class_keys(
+        actions,
+        rows(&wire["deck"]["hand"]),
+        rows(&wire["player"]["potions"]),
+        None,
+        &mut |_| unreachable!("combat turn actions contain no choices"),
+        &wire["deck"],
+    )
+    .map_err(|_| {
+        mismatch(
+            "direct_classes",
+            "Public class encoding refused the action list",
+        )
+    })?;
+    Ok(classes_from_keys(&keys))
+}
+
+fn native_observed_row(net: &E2eNet, mut rm: RunManager) -> Result<Option<PolicyRow>> {
+    let cs = rm.combat.as_ref().expect("simulator combat");
+    rm.run_state.current_hp = cs.player.current_hp;
+    rm.run_state.max_hp = cs.player.max_hp;
+    let Next::Decision(d) = Driver::new(0).peek(&mut rm) else {
+        return Ok(None);
+    };
+    model::observed_combat_row(net, &d, &rm).map(Some)
 }
 
 fn compare(
@@ -211,6 +308,15 @@ fn compare(
             "Reference policy action groups differ",
         ));
     }
+    let direct = direct_classes(&obs, &reference.actions, oracle.ascension_level);
+    let direct_label = match direct {
+        Ok((classes, members)) if classes == reference.classes && members == reference.members => {
+            "direct_public_class_match"
+        }
+        Ok(_) => "direct_public_class_mismatch",
+        Err(_) => "direct_public_class_unavailable",
+    };
+    *report.checks.entry(direct_label).or_default() += 1;
     *report
         .checks
         .entry("exact_policy_action_groups")
@@ -277,11 +383,22 @@ impl Report {
             }
         };
         let public = comparable_board(raw.clone());
-        if !self
-            .seen
-            .insert(format!("{:x}", Sha256::digest(public.to_string())))
-        {
-            self.duplicates += 1;
+        let semantic = match oracle_signature(rm, actions) {
+            Ok(signature) => signature,
+            Err(err) => {
+                *self.outcomes.entry("projection_error").or_default() += 1;
+                *self
+                    .blocked
+                    .entry(format!("{}: {}", err.code, err.message))
+                    .or_default() += 1;
+                return;
+            }
+        };
+        if !record_position(
+            self,
+            format!("{:x}", Sha256::digest(public.to_string())),
+            semantic,
+        ) {
             return;
         }
         let ids = list_powers(&raw)
@@ -293,6 +410,35 @@ impl Report {
             .any(|id| !powers::registry_id(id).is_some_and(powers::legacy));
         self.historical_power_gate_rejects += usize::from(historical_gate_rejects);
         let enemies = rows(&raw["enemies"]);
+        *self
+            .positions_by_act
+            .entry(rm.run_state.act_index)
+            .or_default() += 1;
+        if let Some(room) = raw["room_type"].as_str() {
+            *self.positions_by_room.entry(room.to_owned()).or_default() += 1;
+        }
+        let vars = sim_observation::card_variables(rm);
+        let legacy_card_marker = !vars.is_empty();
+        self.legacy_card_marker_positions += usize::from(legacy_card_marker);
+        let mut unproven = false;
+        let mut keys = BTreeSet::new();
+        for (id, key, value, published) in vars {
+            let name = sts2_wire::state_dict::var_key_wire_name(key);
+            keys.insert(format!("{id} | {name}"));
+            // Generation provenance is read by the thief and Fool handlers,
+            // outside the admitted solo Ironclad board.
+            let known = match key {
+                VarKey::GeneratedInCombat => enemies.iter().all(|e| e["id"] != "THIEVING_HOPPER"),
+                VarKey::ReturnIfPlayedRound => matches!(id, "BOLAS" | "THRUMMING_HATCHET"),
+                // This lifespan is updated by RunManager at combat exit.
+                VarKey::Generic => id == "GUILTY",
+                _ => false,
+            };
+            unproven |= value != 0 && !known && !published;
+        }
+        for key in keys {
+            *self.private_card_variables.entry(key).or_default() += 1;
+        }
         self.multiple_enemies +=
             usize::from(enemies.iter().filter(|e| e["is_alive"] == true).count() >= 2);
         self.intent_kinds.extend(
@@ -344,9 +490,68 @@ impl Report {
             };
             *self.checks.entry(label).or_default() += 1;
         }
-        let outcome = match compare(&raw, rm, actions, net, self) {
+        if let Some(net) = net
+            && self.invariance_strata.insert((
+                rm.run_state.act_index,
+                !ids.is_empty(),
+                enemies.iter().filter(|e| e["is_alive"] == true).count() >= 2,
+                rows(&raw["hand"])
+                    .iter()
+                    .any(|c| !c["enchantment"].is_null() || c["base_cost"] != c["effective_cost"]),
+            ))
+        {
+            let mut changed = rm.clone();
+            let cs = changed.combat.as_mut().expect("simulator combat");
+            sts2_core::blindfold::blindfold_root(cs, 202_608);
+            let original = native_observed_row(net, rm.clone());
+            let redealt = native_observed_row(net, changed);
+            let label = match (original, redealt) {
+                (Ok(Some(a)), Ok(Some(b))) => {
+                    if a == b
+                        && net
+                            .try_logits(&a)
+                            .ok()
+                            .zip(net.try_logits(&b).ok())
+                            .is_some_and(|(left, right)| left == right)
+                    {
+                        "same_policy_and_logits_after_redeal"
+                    } else {
+                        "different_policy_or_logits_after_redeal"
+                    }
+                }
+                (Ok(None), Ok(None)) => "redeal_forced_position",
+                _ => "redeal_oracle_unavailable",
+            };
+            *self.checks.entry(label).or_default() += 1;
+        }
+        let outcome = match compare(&raw, rm, actions, net, self).and_then(|status| {
+            if unproven {
+                Err(mismatch(
+                    "sim_card_state_unproven",
+                    "A relevant card instance field has no audited public carrier",
+                ))
+            } else {
+                Ok(status)
+            }
+        }) {
             Ok(outcome) => outcome,
             Err(err) => {
+                if err.message == "Upstream combat translation dropped a board item"
+                    && let Ok(obs) = observation::sanitize_live(&raw, Context::Combat)
+                    && let Ok((_, warnings)) = engine::combat_wire(&obs.board, rm.ascension_level)
+                {
+                    for warning in warnings.into_iter().collect::<BTreeSet<_>>() {
+                        *self.importer_warnings.entry(warning).or_default() += 1;
+                    }
+                }
+                if let Some(encounter) = raw["encounter_id"].as_str() {
+                    *self
+                        .first_failure_by_encounter
+                        .entry(encounter.to_owned())
+                        .or_default()
+                        .entry(err.message.clone())
+                        .or_default() += 1;
+                }
                 let diagnostic = super::diagnostics::record(
                     &raw,
                     super::session::Position {
@@ -384,6 +589,12 @@ impl Report {
                 "blocked"
             }
         };
+        if legacy_card_marker {
+            *self
+                .reevaluated_legacy_card_blocks
+                .entry(outcome.to_owned())
+                .or_default() += 1;
+        }
         self.recovered_after_historical_power_gate +=
             usize::from(historical_gate_rejects && outcome != "blocked");
         *self.outcomes.entry(outcome).or_default() += 1;
@@ -428,11 +639,14 @@ fn walk(
     net: Option<&E2eNet>,
     seed: i64,
     steps: usize,
-    stop_on_combat_end: bool,
+    sampling: Sampling,
 ) -> Result<()> {
     let mut driver = Driver::new(seed);
+    let mut cache = TokCache::new();
     let mut ending = json!({"seed":seed,"status":"step_limit"});
+    let mut acts = BTreeSet::new();
     for step in 0..steps {
+        acts.insert(rm.run_state.act_index);
         let next = driver.peek(&mut rm);
         let combat_decision = match &next {
             Next::Decision(d) => Context::from_dtype(d.dtype).ok() == Some(Context::Combat),
@@ -447,9 +661,16 @@ fn walk(
             report.evaluate(&rm, &actions, net);
         }
         let (action, kind) = match next {
-            Next::Decision(d) => d
-                .member_action(choose(&d, step, seed))
-                .map_err(|e| mismatch("sim_generation", &e))?,
+            Next::Decision(d) => {
+                if let Sampling::Instinct(model) = sampling {
+                    let (logits, _) = model::infer(model, &d, &rm, &mut cache)?;
+                    d.class_action(argmax(&logits))
+                        .map_err(|e| mismatch("sim_generation", &e))?
+                } else {
+                    d.member_action(choose(&d, step, seed))
+                        .map_err(|e| mismatch("sim_generation", &e))?
+                }
+            }
             Next::Forced(f) => (f.action, f.kind),
             Next::Terminal(t) => {
                 ending = json!({"seed":seed,"status":t.outcome,"error":t.error,"cap":t.cap});
@@ -459,13 +680,45 @@ fn walk(
         driver
             .apply(&mut rm, &action, kind)
             .map_err(|e| mismatch("sim_generation", &e))?;
-        if stop_on_combat_end && rm.combat.as_ref().is_none_or(|cs| cs.is_over) {
+        if matches!(sampling, Sampling::ConfiguredFight)
+            && rm.combat.as_ref().is_none_or(|cs| cs.is_over)
+        {
             ending = json!({"seed":seed,"status":"completed_combat"});
             break;
         }
     }
+    ending["acts"] = json!(acts);
     report.runs.push(ending);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dedup_keeps_distinct_oracle_signatures_for_one_public_board() {
+        let mut report = Report::default();
+        assert!(record_position(
+            &mut report,
+            "public".into(),
+            "unused".into()
+        ));
+        assert!(record_position(
+            &mut report,
+            "public".into(),
+            "consumed".into()
+        ));
+        assert!(!record_position(
+            &mut report,
+            "public".into(),
+            "unused".into()
+        ));
+        assert_eq!(report.seen.len(), 1);
+        assert_eq!(report.semantic_positions, 2);
+        assert_eq!(report.public_collisions, 1);
+        assert_eq!(report.duplicates, 1);
+    }
 }
 
 fn summarize(report: Report, weighted: bool) -> Value {
@@ -477,15 +730,29 @@ fn summarize(report: Report, weighted: bool) -> Value {
         .iter()
         .map(|key| report.outcomes.get(key).copied().unwrap_or_default())
         .sum::<usize>();
+    let denominator = report.semantic_positions
+        + report
+            .outcomes
+            .get("projection_error")
+            .copied()
+            .unwrap_or_default();
     json!({"source":"simulator_derived","live_validate_count":0,"synthetic_fixture_count":0,
         "weighted":weighted,
-        "unique":report.seen.len(),"duplicate":report.duplicates,"projection_errors_deduplicated":false,
-        "outcomes":report.outcomes,"coverage": if report.seen.is_empty(){None}else{Some(covered as f64/report.seen.len() as f64)},
+        "unique":report.semantic_positions,"unique_public_fingerprints":report.seen.len(),
+        "distinct_semantic_positions_at_matching_public_fingerprint":report.public_collisions,
+        "duplicate":report.duplicates,"projection_errors_deduplicated":false,"denominator":denominator,
+        "outcomes":report.outcomes,"coverage": (denominator != 0).then(|| covered as f64/denominator as f64),
         "ranked_blockers":blockers,"ranked_blocker_shapes":blocker_details,"powers":report.powers,"relics":report.relics,"potions":report.potions,"cards":report.cards,
         "encounters":report.encounters,"intent_kinds":report.intent_kinds,"multiple_enemies":report.multiple_enemies,"combined_powers":report.combined_powers,
         "modified_cards":report.modified_cards,"historical_power_gate_rejects":report.historical_power_gate_rejects,
         "recovered_after_historical_power_gate":report.recovered_after_historical_power_gate,
         "parity_checks":report.checks,"different_policy_fields":report.token_diff,
+        "positions_by_act":report.positions_by_act,"positions_by_room":report.positions_by_room,
+        "oracle_card_variable_shapes":report.private_card_variables,
+        "simulator_importer_warnings":report.importer_warnings,
+        "first_failure_by_encounter":report.first_failure_by_encounter,
+        "positions_with_old_projector_card_marker":report.legacy_card_marker_positions,
+        "outcomes_for_old_projector_card_marker":report.reevaluated_legacy_card_blocks,
         "max_logit_abs_delta":weighted.then_some(report.max_logit_abs_delta),"runs":report.runs})
 }
 
@@ -613,11 +880,47 @@ fn targeted_run(encounter: &str, seed: i64) -> Result<RunManager> {
     Ok(rm)
 }
 
+#[derive(Clone, Copy)]
+enum Sampling<'a> {
+    Development,
+    ConfiguredFight,
+    Instinct(&'a E2eNet),
+}
+
+const HELD_OUT_FIRST_SEED: i64 = 182_003_700;
+
+pub fn held_out(net: &E2eNet, runs: u8, steps: usize) -> Result<Value> {
+    let _scope = Scope::enter(model::BUILD);
+    let mut campaign = Report::default();
+    for seed in HELD_OUT_FIRST_SEED..HELD_OUT_FIRST_SEED + i64::from(runs) {
+        walk(
+            &mut campaign,
+            new_run_at(seed, 0),
+            Some(net),
+            seed,
+            steps,
+            Sampling::Instinct(net),
+        )?;
+    }
+    Ok(
+        json!({"schema_version":1,"upstream_revision":model::REVISION,"engine_build":model::BUILD.as_str(),
+        "model":model::pin(),"sampling_policy":model::OBSERVATION,"evaluation_policy":model::OBSERVED_COMBAT,
+        "first_seed":HELD_OUT_FIRST_SEED,"held_out":summarize(campaign,true)}),
+    )
+}
+
 pub fn run(net: Option<&E2eNet>, runs: u8, steps: usize) -> Result<Value> {
     let _scope = Scope::enter(model::BUILD);
     let mut campaign = Report::default();
     for seed in FIRST_SEED..FIRST_SEED + i64::from(runs) {
-        walk(&mut campaign, new_run_at(seed, 0), net, seed, steps, false)?;
+        walk(
+            &mut campaign,
+            new_run_at(seed, 0),
+            net,
+            seed,
+            steps,
+            Sampling::Development,
+        )?;
     }
     let mut targeted = BTreeMap::new();
     for (i, encounter) in ["NIBBITS_WEAK", "BYGONE_EFFIGY_ELITE", "CORPSE_SLUGS_NORMAL"]
@@ -632,7 +935,7 @@ pub fn run(net: Option<&E2eNet>, runs: u8, steps: usize) -> Result<Value> {
             net,
             seed,
             40,
-            true,
+            Sampling::ConfiguredFight,
         )?;
         targeted.insert(encounter, summarize(report, net.is_some()));
     }

@@ -4,8 +4,12 @@ use serde_json::{Value, json};
 use sts2_advisor::{board, combat_mirror, graft, instinct_combat, instinct_screens};
 use sts2_content::monster_dispatch::build_ai_for_version;
 use sts2_core::{
-    CreatureUid, MonsterKind, card_by_uid, creature_by_id, creature_by_id_mut,
-    hooks::effective_card_cost, monster_ai::MonsterState, run_manager::RunManager,
+    Card, CreatureUid, RelicId, card_by_uid,
+    cards::{EnchantmentId, VarKey},
+    creature_by_id, creature_by_id_mut,
+    hooks::effective_card_cost,
+    monster_ai::MonsterState,
+    run_manager::RunManager,
 };
 use sts2_e2e::{
     build::Scope,
@@ -167,6 +171,18 @@ fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action,
                     continue;
                 }
                 use_potions = true;
+                if p["requires_target"] == true && p["target_type"] == "AnyEnemy" {
+                    if p["valid_target_indices"].is_null() {
+                        return Err(coverage(
+                            "The producer cannot prove all targets of this potion",
+                        ));
+                    }
+                    for target in targets(b, p)? {
+                        actions.insert(Action::Potion(i as u64, target),
+                            json!({"kind":"potion","slot":i,"id":p["id"],"name":p["name"],"target":enemy_detail(b, target)}));
+                    }
+                    continue;
+                }
                 // The session only admits one player. An AnyPlayer potion
                 // with no target picker can only address that player.
                 if p["requires_target"] == true
@@ -295,7 +311,12 @@ fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
         return Err(rebuild("Reconstructed enemy count differs"));
     }
     for (i, (e, row)) in enemies.iter().zip(emitted).enumerate() {
-        if e["is_alive"] == false {
+        if e["is_alive"] == false
+            && !list(e, "powers", 64)?.iter().any(|power| {
+                super::powers::registry_id(power["id"].as_str().unwrap_or_default())
+                    == Some(sts2_core::PowerKind::Illusion)
+            })
+        {
             continue;
         }
         let actual = list(e, "intents", 8)?;
@@ -306,21 +327,20 @@ fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
             continue;
         }
         let missing = || rebuild("A visible intent or its shown damage could not be reconstructed");
-        if actual.len() < 2 || b["round"] != 1 {
+        if actual.len() < 2
+            || !rebuilt
+                .first()
+                .is_some_and(|head| matches_telegraph(&actual[..1], std::slice::from_ref(head)))
+        {
             return Err(missing());
         }
         // The seedless wire rebuild can retain the leading icon alone.
-        // These three observed opening telegraphs have no spawn data in
-        // the candidate moves. Select solely from the full visible icons.
+        // The reconstructed head is already independently checked. Select
+        // the complete current move only when its entire display uniquely
+        // matches the versioned factory. The policy masks future moves.
         let uid = CreatureUid(cs.enemy_uids[i].0);
         let species = creature_by_id(&cs.creatures, uid.0)
             .and_then(|c| c.species)
-            .filter(|s| {
-                matches!(
-                    s,
-                    MonsterKind::Nibbit | MonsterKind::SnappingJaxfruit | MonsterKind::Flyconid
-                )
-            })
             .ok_or_else(missing)?;
         let mut ai = build_ai_for_version(
             species,
@@ -356,6 +376,59 @@ fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
         creature.intent = Some(head);
     }
     Ok(())
+}
+
+pub(super) fn enchantment_used_var(enchantment: EnchantmentId) -> Option<i32> {
+    let mut card = Card::pod_defaults();
+    match enchantment {
+        EnchantmentId::Glam => sts2_content::enchantments::mark_glam_used(&mut card),
+        EnchantmentId::Vigorous => sts2_content::enchantments::mark_vigorous_used(&mut card),
+        // The pinned core's EnchantmentUsed wire representation. In
+        // v0.111.0 these become used during OnPlay, before a settled board.
+        EnchantmentId::Swift => return Some(0b0100),
+        EnchantmentId::Sown => return Some(0b1000),
+        _ => return None,
+    }
+    Some(card.combat_var(VarKey::EnchantmentUsed))
+}
+
+pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<String>)> {
+    let mut board = public.clone();
+    // These two relics have acquisition behavior only in this build
+    // (RelicId::to_relic_kind returns None). They remain on the original
+    // run board for graft_run and for the encoder's run relic summary.
+    if let Some(relics) = board["run_state"]["relics"].as_array_mut() {
+        relics.retain(|r| {
+            let kind = r["id"].as_str().and_then(|id| {
+                sts2_content::names::relic_id_from_str_any_build(
+                    id.strip_prefix("RELIC.").unwrap_or(id),
+                )
+            });
+            !matches!(kind, Some(RelicId::NeowsSacrifice | RelicId::DowsingRod))
+                || r["is_wax"] == true
+                || r["is_melted"] == true
+        });
+    }
+    let stamp = |cards: &mut Value| {
+        for row in cards.as_array_mut().into_iter().flatten() {
+            if row["observer_enchantment_status"] != "Disabled" {
+                continue;
+            }
+            let name = row["enchantment"].as_str().unwrap_or_default();
+            if let Some(used) =
+                EnchantmentId::from_wire_name(name.split(" / ").next().unwrap_or(name))
+                    .and_then(enchantment_used_var)
+            {
+                row["combat_vars"]["enchantment_used"] = json!(used);
+            }
+        }
+    };
+    stamp(&mut board["hand"]);
+    for pile in ["draw_pile", "discard_pile", "exhaust_pile", "play_pile"] {
+        stamp(&mut board[pile]["cards"]);
+    }
+    board::combat_wire(&board, Some("Ironclad"), i64::from(ascension), 0, 0)
+        .map_err(|_| rebuild("Upstream could not translate the combat board"))
 }
 
 pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
@@ -402,14 +475,7 @@ pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
     }
     match obs.context {
         Context::Combat => {
-            let (wire, warnings) = board::combat_wire(
-                &board,
-                Some("Ironclad"),
-                i64::from(rm.ascension_level),
-                0,
-                0,
-            )
-            .map_err(|_| rebuild("Upstream could not translate the combat board"))?;
+            let (wire, warnings) = combat_wire(&board, rm.ascension_level)?;
             if !warnings.is_empty() {
                 return Err(rebuild("Upstream combat translation dropped a board item"));
             }

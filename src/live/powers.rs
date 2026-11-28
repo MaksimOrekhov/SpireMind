@@ -44,17 +44,34 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
     }
     match (kind, owner) {
         (
-            Barricade | Clarity | Corruption | Cruelty | DarkEmbrace | DemonForm | FeelNoPain
-            | NoDraw | Rage | RetainHand | Rupture | SetupStrike,
+            Barricade | Clarity | Colossus | Corruption | Cruelty | DarkEmbrace | DemonForm
+            | FeelNoPain | FlexPotion | NoDraw | Rage | RetainHand | Rupture | SetupStrike
+            | SpeedPotion,
             Owner::Player,
         ) => ("visible_amount", "Pinned hooks read presence or amount"),
-        (Shrink, _) | (Plating, Owner::Player) | (Ravenous | Shriek | Slippery, Owner::Enemy) => (
+        (Shrink, _) | (Ravenous | Shriek | Slippery | Suck, Owner::Enemy) => (
             "visible_amount",
             "Pinned damage and turn hooks read the shown amount and public board",
         ),
         (Minion, Owner::Enemy) => (
             "visible_amount",
             "Pinned engine checks presence for secondary enemies",
+        ),
+        (Stampede, Owner::Player) => (
+            "visible_amount",
+            "Native Stampede reads the stack and current hand; future random picks are absent from the policy observation",
+        ),
+        (Plating, _) => (
+            "visible_amount",
+            "Standard pinned build has no Dread-only delayed round counter",
+        ),
+        (Tangled, Owner::Player) => (
+            "visible_amount",
+            "Pinned cost hook uses the amount and each card's observed Entangled affliction",
+        ),
+        (Illusion, Owner::Enemy) => (
+            "visible_amount",
+            "Presence is sufficient for a live creature; the adapter rejects a corpse awaiting revival",
         ),
         (Slow, Owner::Enemy) => (
             "public_parameter",
@@ -69,12 +86,8 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
             "Pinned state_dict derives the counter from this turn's Attack bucket",
         ),
         (Unmovable, Owner::Player) => (
-            "public_history_pending",
-            "Pinned mirror uses distinct card-sourced block gains; requires position-level parity",
-        ),
-        (Plating, Owner::Enemy) => (
-            "public_history_pending",
-            "Pinned hooks use a round-specific counter after an enemy gains Plating",
+            "public_history",
+            "Producer and upstream count block entries from finished card plays this turn",
         ),
         (CrimsonMantle | Inferno | ToricToughness | PainfulStabs, _) => (
             "public_parameter_pending",
@@ -84,7 +97,7 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
             "public_parameter_pending",
             "Upstream uses ownership or applier; solo identity mapping requires proof",
         ),
-        (Ambergris | Panache | Surrounded | Skittish, _) => (
+        (Ambergris | Hellraiser | Panache | Surrounded | Skittish, _) => (
             "hidden_or_ambiguous",
             "Current wire cannot prove one exact state without a hidden or ambiguous counter",
         ),

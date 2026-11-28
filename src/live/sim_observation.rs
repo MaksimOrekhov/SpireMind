@@ -2,8 +2,8 @@
 //! This module has no access to the live connection.
 use serde_json::{Value, json};
 use sts2_core::{
-    Card, CombatState, card_by_uid,
-    cards::{TargetType, effective_target_type},
+    Card, CombatState, LocalCostMod, card_by_uid,
+    cards::{TargetType, VarKey, effective_target_type},
     creature_by_id, potion_effects,
     potions::PotionTargetType,
     run_manager::RunManager,
@@ -40,14 +40,59 @@ fn combat_card(cs: &CombatState, c: &Card, wire: &Value) -> Value {
     result["base_cost"] = wire["base_cost"].clone();
     result["cost"] = wire["cost_override"].clone();
     result["effective_cost"] = wire["cost_override"].clone();
+    if !c.cost.mods().is_empty() && c.base_cost() >= 0 {
+        for (key, expiry) in [
+            ("persistent_cost", LocalCostMod::END_OF_TURN),
+            ("played_cost", LocalCostMod::WHEN_PLAYED),
+            (
+                "stable_cost",
+                LocalCostMod::END_OF_TURN | LocalCostMod::WHEN_PLAYED,
+            ),
+        ] {
+            let cost = c
+                .cost
+                .mods()
+                .iter()
+                .filter(|m| m.flags() & expiry == 0)
+                .fold(i32::from(c.base_cost()), |cost, m| m.modify(cost));
+            result[key] = json!(cost.max(0));
+        }
+    }
+    let mut stats = serde_json::Map::new();
+    for (key, field) in [("damage", "base_damage"), ("block", "base_block")] {
+        if wire[field].as_i64().is_some_and(|n| n != 0) {
+            stats.insert(key.to_owned(), wire[field].clone());
+        }
+    }
+    if !stats.is_empty() {
+        result["stats"] = Value::Object(stats);
+    }
+    if let Some(mask) = c
+        .enchantments
+        .first()
+        .and_then(|(id, _)| super::engine::enchantment_used_var(id))
+    {
+        result["observer_enchantment_status"] = if c.combat_var(VarKey::EnchantmentUsed) & mask == 0
+        {
+            json!("Normal")
+        } else {
+            json!("Disabled")
+        };
+    }
     for key in ["affliction", "affliction_stacks", "base_replay_count"] {
         if let Some(value) = wire.get(key) {
             result[key] = value.clone();
         }
     }
-    if wire.get("combat_vars").is_some() {
-        // Signal a required per-instance field. Its raw values are private.
-        result["combat_vars"] = json!({});
+    // These are the only card/field pairs SerializeCard actually emits.
+    // Its payload is a round, while the engine's value counts player turns.
+    let played = c.combat_var(VarKey::ReturnIfPlayedRound);
+    if matches!(result["id"].as_str(), Some("BOLAS" | "THRUMMING_HATCHET"))
+        && cs.turn_number() == cs.round
+        && played > 0
+        && (i32::from(cs.round) - 1..=i32::from(cs.round)).contains(&played)
+    {
+        result["combat_vars"] = json!({"return_if_played_round":played});
     }
     if let Some(flags) = wire["flags"].as_array() {
         for key in ["ethereal", "innate", "retain"] {
@@ -57,6 +102,33 @@ fn combat_card(cs: &CombatState, c: &Card, wire: &Value) -> Value {
         }
     }
     result
+}
+
+// This audit stays outside the projected Advisor data. The producer cannot
+// send a marker for a field it does not serialize.
+pub(super) fn card_variables(rm: &RunManager) -> Vec<(&'static str, VarKey, i32, bool)> {
+    let Some(cs) = &rm.combat else {
+        return Vec::new();
+    };
+    cs.player
+        .hand
+        .iter()
+        .chain(&cs.player.draw)
+        .chain(&cs.player.discard)
+        .chain(&cs.player.exhaust)
+        .chain(&cs.player.play)
+        .filter_map(|&uid| card_by_uid(&cs.cards, uid))
+        .flat_map(|c| {
+            c.combat_vars.iter().map(move |(k, value)| {
+                let published = k == VarKey::EnchantmentUsed
+                    && c.enchantments
+                        .first()
+                        .and_then(|(id, _)| super::engine::enchantment_used_var(id))
+                        == Some(value);
+                (c.card_id.to_python_name(), k, value, published)
+            })
+        })
+        .collect()
 }
 
 fn powers(wire: &Value) -> Vec<Value> {
@@ -119,7 +191,8 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
     let mut public_player = json!({
         "hp":player["hp"],"max_hp":player["max_hp"],"energy":player["energy"],
         "max_energy":player["max_energy"],"block":player["block"],"powers":powers(&player["powers"]),
-        "cards_played_this_turn":[0,0,0,0,0]
+        "cards_played_this_turn":[0,0,0,0,0],
+        "card_block_gains_this_turn":0,"extra_turns_taken_this_combat":0
     });
     for field in [
         "cards_played_this_turn",
@@ -152,8 +225,14 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
                 None => "Unknown",
             };
             let usable = rows(actions).iter().any(|a| a["slot"] == slot && matches!(a["action"].as_str(), Some("potion" | "drink_potion")));
-            json!({"slot":slot,"empty":false,"id":p.python_name(),"name":p.python_name(),"usage":"CombatOnly",
-                "can_use":usable,"target_type":target,"requires_target":target=="AnyEnemy"})
+            let mut entry = json!({"slot":slot,"empty":false,"id":p.python_name(),"name":p.python_name(),"usage":"CombatOnly",
+                "can_use":usable,"target_type":target,"requires_target":target=="AnyEnemy"});
+            if target == "AnyEnemy" {
+                entry["valid_target_indices"] = json!(rows(actions).iter()
+                    .filter(|a| a["slot"] == slot && matches!(a["action"].as_str(), Some("potion" | "drink_potion")))
+                    .filter_map(|a| a["target_index"].as_u64()).collect::<Vec<_>>());
+            }
+            entry
         })
         .collect::<Vec<_>>();
     let relics = run
@@ -190,7 +269,13 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
             .ok_or_else(|| projection("Missing enemy species"))?
             .python_name();
         let alive = e.current_hp > 0;
-        let intents = if alive {
+        let visible_revive = !alive
+            && rows(&wire["encounter"][i]["powers"])
+                .iter()
+                .any(|p| p["name"] == "ILLUSION")
+            && rows(&telegraphs[i]).len() == 1
+            && telegraphs[i][0]["kind"] == "Heal";
+        let intents = if alive || visible_revive {
             rows(&telegraphs[i])
                 .iter()
                 .map(|intent| {
@@ -232,7 +317,7 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
         "game_version":BUILD.as_str(),"mod_version":super::observation::MOD,
         "player_count":1,"act":run.act_index,"act_name":act,"floor":run.game_floor(),
         "current_room":room,"room_type":room,"encounter_id":run_wire::combat_encounter_id(rm),
-        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1},
+        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1,"spiremind_card_status":1,"spiremind_potion_targets":1},
         "map":map(rm)?,"player":public_player,"enemies":enemies,
         "run_state":{"character":"IRONCLAD","game_mode":"standard","ascension":rm.ascension_level,
             "hp":player["hp"],"max_hp":player["max_hp"],"gold":run_wire::gold(rm),"relics":relics,

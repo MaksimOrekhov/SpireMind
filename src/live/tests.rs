@@ -256,6 +256,71 @@ fn synthetic_slow_uses_only_the_public_counter_carrier() {
 }
 
 #[test]
+fn live_enchantment_display_rules_out_wrong_card_preview_with_same_actions() {
+    use sts2_e2e::build::Scope;
+    use sts2_wire::emit;
+
+    let _scope = Scope::enter(model::BUILD);
+    let mut raw = base(Context::Combat);
+    raw["round"] = json!(2);
+    raw["player"]["extra_turns_taken_this_combat"] = json!(0);
+    raw["hand"][0]["enchantment"] = json!("VIGOROUS");
+    raw["hand"][0]["enchantment_amount"] = json!(5);
+    assert_eq!(
+        observation::sanitize_live(&raw, Context::Combat)
+            .err()
+            .unwrap()
+            .code,
+        "card_public_state_missing"
+    );
+    raw["hand"][0]["observer_enchantment_status"] = json!("Normal");
+    assert!(observation::sanitize_live(&raw, Context::Combat).is_err());
+    raw["capabilities"]["spiremind_card_status"] = json!(1);
+    let active = observation::sanitize_live(&raw, Context::Combat).unwrap();
+    raw["hand"][0]["observer_enchantment_status"] = json!("Disabled");
+    let spent = observation::sanitize_live(&raw, Context::Combat).unwrap();
+    assert_ne!(active.board, spent.board);
+    let active_fight = engine::reconstruct(&active).unwrap().combat.unwrap();
+    let spent_fight = engine::reconstruct(&spent).unwrap().combat.unwrap();
+    assert_eq!(
+        emit::legal_actions(&active_fight),
+        emit::legal_actions(&spent_fight)
+    );
+    assert_ne!(
+        emit::card_damage_live(&active_fight),
+        emit::card_damage_live(&spent_fight)
+    );
+    assert!(sanitize(&spent.board, Context::Combat).is_ok());
+}
+
+#[test]
+fn targeted_potion_requires_current_observed_legal_enemy_indices() {
+    let mut raw = base(Context::Combat);
+    raw["capabilities"]["spiremind_potion_targets"] = json!(1);
+    raw["potions"][0] = json!({"slot":0,"empty":false,"id":"FIRE_POTION","name":"Fire Potion",
+        "usage":"CombatOnly","can_use":true,"target_type":"AnyEnemy","requires_target":true,
+        "valid_target_indices":[0,2]});
+    raw["run_state"]["potions"] = raw["potions"].clone();
+    raw["available_actions"] = json!(["PLAY", "END_TURN", "POTION"]);
+    let _scope = sts2_e2e::build::Scope::enter(model::BUILD);
+    let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+    let rm = engine::reconstruct(&obs).unwrap();
+    let (_, actions) = engine::checked_actions(&obs, &rm).unwrap();
+    let targets = actions
+        .iter()
+        .filter(|a| a["action"]["kind"] == "potion")
+        .map(|a| a["action"]["target"]["combat_id"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(targets, vec![json!(91), json!(93)]);
+    for bad in [json!([0]), json!([0, 1, 2]), json!([0, 0, 2]), Value::Null] {
+        raw["potions"][0]["valid_target_indices"] = bad;
+        raw["run_state"]["potions"] = raw["potions"].clone();
+        let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+        assert!(engine::checked_actions(&obs, &rm).is_err());
+    }
+}
+
+#[test]
 fn simulator_compatibility_structural_suite() {
     let result = super::compatibility::run(None, 1, 95).unwrap();
     assert_eq!(result["campaign"]["source"], "simulator_derived");
