@@ -13,6 +13,7 @@ pub(super) enum Owner {
 pub(super) fn registry_id(id: &str) -> Option<PowerKind> {
     power_kind_from_python_name(id)
         .or_else(|| power_kind_from_python_name(id.strip_suffix("_POWER")?))
+        .filter(|kind| kind.exists_in(crate::model::BUILD))
 }
 
 pub(super) fn legacy(kind: PowerKind) -> bool {
@@ -83,7 +84,7 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
             "public_parameter_pending",
             "Upstream uses ownership or applier; solo identity mapping requires proof",
         ),
-        (Panache | Surrounded | Skittish, _) => (
+        (Ambergris | Panache | Surrounded | Skittish, _) => (
             "hidden_or_ambiguous",
             "Current wire cannot prove one exact state without a hidden or ambiguous counter",
         ),

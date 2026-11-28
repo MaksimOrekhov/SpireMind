@@ -281,6 +281,25 @@ fn simulator_compatibility_structural_suite() {
 }
 
 #[test]
+fn matrix_uses_the_model_build_registry() {
+    let matrix = super::compatibility::power_matrix();
+    let ids: std::collections::BTreeSet<_> = matrix["powers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap())
+        .collect();
+    let upstream: std::collections::BTreeSet<_> = sts2_core::PowerKind::all_for(model::BUILD)
+        .iter()
+        .map(|kind| kind.python_name())
+        .collect();
+    assert_eq!(ids, upstream);
+    assert_eq!(matrix["powers"].as_array().unwrap().len(), upstream.len());
+    assert!(ids.contains("AMBERGRIS"));
+    assert!(!ids.contains("AIM") && !ids.contains("OUTBREAK"));
+}
+
+#[test]
 #[ignore = "requires the pinned Instinct weights"]
 fn compatibility_model_smoke_simulator_policy_parity() {
     let net = model::load(&model::default_weights()).unwrap();

@@ -19,7 +19,9 @@ use crate::{Failure, Result, contract::Context, model, simulation::FIRST_SEED};
 
 pub fn power_matrix() -> Value {
     let ironclad = sts2_core::powers::ironclad::ironclad_power_kinds();
-    let rows = PowerKind::all()
+    let rows = PowerKind::all_for(model::BUILD)
+        .into_iter()
+        .collect::<BTreeSet<_>>()
         .iter()
         .map(|&kind| {
             let spawn_sources = |enemy: bool| {
@@ -47,7 +49,7 @@ pub fn power_matrix() -> Value {
         })
         .collect::<Vec<_>>();
     json!({"upstream_revision":model::REVISION,"engine_build":model::BUILD.as_str(),
-        "scope":"entire pinned registry across builds; ownership and spawn sources are lower bounds for Ironclad reachability",
+        "scope":"pinned game build; ownership and spawn sources are lower bounds for Ironclad reachability",
         "powers":rows})
 }
 
