@@ -72,6 +72,9 @@ enum Mode {
         /// Save sanitized observations in this local directory.
         #[arg(long)]
         capture_dir: Option<PathBuf>,
+        /// Write a bounded, redacted blocker corpus to a new directory.
+        #[arg(long)]
+        blocked_corpus: Option<PathBuf>,
         /// Write JSON Lines events with explicit stale notices.
         #[arg(long)]
         json: bool,
@@ -124,6 +127,7 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             ttl_ms,
             release_info,
             capture_dir,
+            blocked_corpus,
             json,
         } => {
             let installed = live::release_build(&release_info)?;
@@ -136,7 +140,15 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
                     ));
                 }
             }
-            live::run(net, port, ttl_ms, json, capture_dir, &installed)?;
+            live::run(
+                net,
+                port,
+                ttl_ms,
+                json,
+                capture_dir,
+                blocked_corpus,
+                &installed,
+            )?;
             Ok((json!({"status":"stopped"}), true))
         }
         Mode::Replay { captures } => live::replay(&net, &captures),

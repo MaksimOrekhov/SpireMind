@@ -1204,6 +1204,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sts2-advisor",
+ "sts2-content",
  "sts2-core",
  "sts2-e2e",
  "sts2-wire",

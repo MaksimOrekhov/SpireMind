@@ -121,6 +121,83 @@ fn synthetic_projection_is_invariant_to_hidden_order_rng_and_forecasts() {
 }
 
 #[test]
+fn synthetic_blocker_panel_reports_multiple_shapes_and_redacts_hidden_inputs() {
+    use super::diagnostics;
+    let mut raw = base(Context::Combat);
+    raw["capabilities"] = json!({"spiremind_power_visibility":1});
+    raw["player"]["powers"] = json!([
+        {"id":"SLOW_POWER","amount":1,"display_amount":3,"name":"Slow","observer_visible":true,"vars":{"SlowAmount":3}},
+        {"id":"SECRET_POWER","amount":1,"observer_visible":false,"vars":{"private":19}}
+    ]);
+    raw["enemies"][0]["powers"] = json!([
+        {"id":"JUGGLING_POWER","amount":1,"display_amount":2,"name":"Juggling","observer_visible":true,"vars":{"Counter":4}}
+    ]);
+    raw["hand"][0]["combat_vars"] = json!({"private_card":99});
+    let position = Position {
+        session: 1,
+        state_id: 11,
+        request_id: 4,
+    };
+    let e = sanitize(&raw, Context::Combat).err().unwrap();
+    assert_eq!(e.code, "unsupported_mechanic");
+    let audit = diagnostics::record(&raw, position, "observation", e.code, None);
+    let blockers = audit["blockers"].as_array().unwrap();
+    assert_eq!(blockers.len(), 4);
+    assert!(
+        blockers
+            .iter()
+            .any(|e| e["id"] == "SLOW" && e["field_types"]["vars"] == "object")
+    );
+    assert!(
+        blockers
+            .iter()
+            .any(|e| e["path"] == "$.player.powers[1]" && e["id"].is_null())
+    );
+    assert!(blockers.iter().any(|e| e["id"] == "JUGGLING"));
+    assert!(!audit.to_string().contains("SECRET_POWER"));
+    assert!(!audit.to_string().contains("private"));
+    raw["rng"] = json!({"run_seed": 987654});
+    raw["player"]["powers"][1]["id"] = json!("OTHER_PRIVATE_POWER");
+    raw["player"]["powers"][0]["vars"]["SlowAmount"] = json!(987654);
+    raw["draw_pile"]["cards"].as_array_mut().unwrap().reverse();
+    assert_eq!(
+        audit,
+        diagnostics::record(&raw, position, "observation", e.code, None)
+    );
+    raw["player"]["hp"] = json!(69);
+    assert_ne!(
+        audit["public_fingerprint"],
+        diagnostics::record(&raw, position, "observation", e.code, None)["public_fingerprint"]
+    );
+    raw["capabilities"] = json!({});
+    let old = diagnostics::record(&raw, position, "observation", e.code, None);
+    assert!(!old.to_string().contains("SLOW"));
+    assert!(!old.to_string().contains("JUGGLING"));
+    let mut hidden_strength = base(Context::Combat);
+    hidden_strength["player"]["powers"] = json!([
+        {"id":"STRENGTH_POWER","amount":1,"name":"Strength","observer_visible":false}
+    ]);
+    assert_eq!(
+        sanitize(&hidden_strength, Context::Combat)
+            .err()
+            .unwrap()
+            .code,
+        "unsupported_mechanic"
+    );
+}
+
+#[test]
+fn synthetic_generated_choice_does_not_become_a_deck_reward() {
+    let mut raw = base(Context::CardReward);
+    raw["surface"] = json!("choose_a_card");
+    raw["prompt_key"] = json!("TO_OBTAIN");
+    assert_eq!(
+        sanitize(&raw, Context::CardReward).err().unwrap().code,
+        "unsupported_state"
+    );
+}
+
+#[test]
 fn synthetic_schema_and_game_gates() {
     for (path, value, code) in [
         (
@@ -340,6 +417,7 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     let live = Live {
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
+        blocked_corpus: Mutex::new(None),
         wake: Condvar::new(),
         terminal: Terminal { json: true },
         ttl: Duration::from_secs(1),
@@ -397,6 +475,7 @@ fn synthetic_cancelled_result_never_enters_reuse_cache() {
     let live = Live {
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
+        blocked_corpus: Mutex::new(None),
         wake: Condvar::new(),
         terminal: Terminal { json: true },
         ttl: Duration::from_secs(1),
@@ -441,6 +520,32 @@ fn synthetic_cancelled_result_never_enters_reuse_cache() {
 #[ignore = "requires official Instinct weights; the Advisor-shaped observations are synthetic"]
 fn live_model_smoke_synthetic_wire_real_instinct() {
     let net = model::load(&model::default_weights()).unwrap();
+    let mut compound = base(Context::Combat);
+    compound["enemies"][0]["intents"] = json!([
+        {"kind":"SingleAttackIntent", "intent_type":"Attack", "damage":6, "hits":1},
+        {"kind":"DefendIntent", "intent_type":"Defend"}
+    ]);
+    let report = engine::advise(&net, &sanitize(&compound, Context::Combat).unwrap()).unwrap();
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["legal_actions"].as_array().unwrap().len(), 5);
+    compound["enemies"][0]["intents"][1]["intent_type"] = json!("Heal");
+    assert_eq!(
+        engine::advise(&net, &sanitize(&compound, Context::Combat).unwrap())
+            .unwrap_err()
+            .code,
+        "reconstruction"
+    );
+
+    let mut entrance = base(Context::Map);
+    entrance["act"] = json!(2);
+    entrance["floor"] = json!(17);
+    entrance["current_room"] = json!("Map");
+    entrance["map"]["current"] = Value::Null;
+    entrance["map"]["nodes"].as_array_mut().unwrap().remove(0);
+    entrance["nodes"] = json!([{"col":3,"row":0,"type":"Ancient","index":0}]);
+    let forced = engine::advise(&net, &sanitize(&entrance, Context::Map).unwrap()).unwrap();
+    assert_eq!(forced["status"], "forced");
+    assert_eq!(forced["legal_actions"][0]["action"]["room_type"], "Ancient");
     for ascension in [0, 10] {
         for c in [Context::Combat, Context::CardReward, Context::Map] {
             let mut b = base(c);

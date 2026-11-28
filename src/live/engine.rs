@@ -2,7 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use sts2_advisor::{board, combat_mirror, graft, instinct_combat, instinct_screens};
-use sts2_core::{card_by_uid, creature_by_id, hooks::effective_card_cost, run_manager::RunManager};
+use sts2_content::monster_dispatch::build_ai_for_version;
+use sts2_core::{
+    CreatureUid, MonsterKind, card_by_uid, creature_by_id, creature_by_id_mut,
+    hooks::effective_card_cost, monster_ai::MonsterState, run_manager::RunManager,
+};
 use sts2_e2e::{
     build::Scope,
     env::{Driver, Next},
@@ -261,10 +265,25 @@ fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action,
     Ok(actions)
 }
 
-fn check_telegraphs(b: &Value, rm: &RunManager) -> Result<()> {
+fn matches_telegraph(actual: &[Value], rebuilt: &[Value]) -> bool {
+    rebuilt.len() == actual.len()
+        && actual.iter().zip(rebuilt).all(|(known, sim)| {
+            instinct_screens::norm_id(&known["intent_type"])
+                == instinct_screens::norm_id(&sim["kind"])
+                && known.get("damage").is_none_or(|d| {
+                    sim.get("effective_amount").or_else(|| sim.get("amount")) == Some(d)
+                })
+                && known.get("hits").is_none_or(|h| {
+                    h.as_u64() == Some(sim.get("times").and_then(Value::as_u64).unwrap_or(1))
+                })
+        })
+}
+
+fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
+    let ascension = rm.ascension_level;
     let cs = rm
         .combat
-        .as_ref()
+        .as_mut()
         .ok_or_else(|| rebuild("Missing combat state"))?;
     let telegraphs = emit::combat::enemy_telegraphs(cs)
         .map_err(|_| rebuild("Could not read reconstructed telegraphs"))?;
@@ -275,7 +294,7 @@ fn check_telegraphs(b: &Value, rm: &RunManager) -> Result<()> {
     if emitted.len() != enemies.len() {
         return Err(rebuild("Reconstructed enemy count differs"));
     }
-    for (e, row) in enemies.iter().zip(emitted) {
+    for (i, (e, row)) in enemies.iter().zip(emitted).enumerate() {
         if e["is_alive"] == false {
             continue;
         }
@@ -283,25 +302,58 @@ fn check_telegraphs(b: &Value, rm: &RunManager) -> Result<()> {
         let rebuilt = row
             .as_array()
             .ok_or_else(|| rebuild("Missing enemy telegraph"))?;
-        if rebuilt.len() != actual.len()
-            || actual.iter().zip(rebuilt).any(|(known, sim)| {
-                instinct_screens::norm_id(&known["intent_type"])
-                    != instinct_screens::norm_id(&sim["kind"])
-                    || known.get("damage").is_some_and(|d| {
-                        sim.get("effective_amount").or_else(|| sim.get("amount")) != Some(d)
-                    })
-                    || known.get("hits").is_some_and(|h| {
-                        // The wire omits `times` for a single attack. The mod
-                        // sends `hits: 1` for the same visible intent.
-                        let hits = sim.get("times").and_then(Value::as_u64).unwrap_or(1);
-                        h.as_u64() != Some(hits)
-                    })
-            })
-        {
-            return Err(rebuild(
-                "A visible intent or its shown damage could not be reconstructed",
-            ));
+        if matches_telegraph(actual, rebuilt) {
+            continue;
         }
+        let missing = || rebuild("A visible intent or its shown damage could not be reconstructed");
+        if actual.len() < 2 || b["round"] != 1 {
+            return Err(missing());
+        }
+        // The seedless wire rebuild can retain the leading icon alone.
+        // These three observed opening telegraphs have no spawn data in
+        // the candidate moves. Select solely from the full visible icons.
+        let uid = CreatureUid(cs.enemy_uids[i].0);
+        let species = creature_by_id(&cs.creatures, uid.0)
+            .and_then(|c| c.species)
+            .filter(|s| {
+                matches!(
+                    s,
+                    MonsterKind::Nibbit | MonsterKind::SnappingJaxfruit | MonsterKind::Flyconid
+                )
+            })
+            .ok_or_else(missing)?;
+        let mut ai = build_ai_for_version(
+            species,
+            Default::default(),
+            Default::default(),
+            ascension,
+            BUILD,
+        );
+        let (id, head) = {
+            let mut candidates = ai.states.iter().filter_map(|(id, state)| {
+                let MonsterState::Move(m) = state else {
+                    return None;
+                };
+                if m.intents.len() != actual.len() {
+                    return None;
+                }
+                let shown: Vec<_> = m
+                    .intents
+                    .iter()
+                    .map(|&intent| emit::combat::intent_to_value(intent, cs, uid))
+                    .collect();
+                matches_telegraph(actual, &shown).then(|| (*id, m.intents[0]))
+            });
+            let unique = candidates.next().ok_or_else(missing)?;
+            if candidates.next().is_some() {
+                return Err(missing());
+            }
+            unique
+        };
+        let creature = creature_by_id_mut(&mut cs.creatures, uid.0).ok_or_else(missing)?;
+        ai.force_current_state_unlogged(id);
+        creature.ai = Some(ai);
+        creature.intent = Some(head);
     }
     Ok(())
 }
@@ -376,7 +428,7 @@ fn reconstruct(obs: &Observation) -> Result<RunManager> {
             {
                 return Err(rebuild("The observed encounter is unsupported"));
             }
-            check_telegraphs(&board, &rm)?;
+            check_telegraphs(&board, &mut rm)?;
         }
         Context::CardReward => {
             let room = graft::live_room(&board)
@@ -457,7 +509,6 @@ fn entrance_action(obs: &Observation) -> Result<Option<Value>> {
     let board = &obs.board;
     let map = &board["map"];
     if obs.context != Context::Map
-        || board["floor"] != 0
         || !map["current"].is_null()
         || !list(map, "visited", 64)?.is_empty()
         || list(map, "nodes", 256)?.iter().any(|node| node["row"] == 0)
@@ -469,12 +520,15 @@ fn entrance_action(obs: &Observation) -> Result<Option<Value>> {
     // visible graph starts at row 1, so this click has no policy decision.
     if let [node] = nodes
         && point(node)? == (3, 0)
-        && node["type"] == "Monster"
+        && ((board["floor"] == 0 && node["type"] == "Monster")
+            || (matches!(board["act"].as_u64(), Some(2 | 3))
+                && board["current_room"] == "Map"
+                && node["type"] == "Ancient"))
     {
         let index = number(node, "index", 255)?;
         return Ok(Some(
             json!({"status":"forced","forced_action_id":0,"legal_actions":[
-                {"action_id":0,"action":{"kind":"move","node_index":index,"col":3,"row":0,"room_type":"Monster"}}
+            {"action_id":0,"action":{"kind":"move","node_index":index,"col":3,"row":0,"room_type":node["type"]}}
             ]}),
         ));
     }

@@ -70,7 +70,23 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  SetAutoPlay(false);
                  DropInflight();
                  // The advisor goes with the mode: so does what it could play.
-@@ -621,6 +626,9 @@
+@@ -548,6 +553,7 @@
+         // (main menu is up); subscriptions stay installed for the session
+         // and every handler self-gates on Mode == Advisor.
+         CombatManager cm = CombatManager.Instance;
++        cm.CreaturesChanged += _ => OnDecisionEdge();
+         cm.PlayerActionsDisabledChanged += _ => OnDecisionEdge();
+         cm.TurnStarted += _ => OnTurnStarted();
+         // CombatEnded(CombatRoom) fires with the room's combat state intact
+@@ -557,6 +563,7 @@
+         {
+             HumanEndTurnPending = false;
+             _aiEndTurnQueued = false;
++            OnDecisionEdge();
+         };
+         cm.History.Changed += OnHistoryChanged;
+         ActiveScreenContext.Instance.Updated += OnScreenUpdated;
+@@ -621,6 +628,9 @@
              // differs (where we stand, what is on offer, what it costs).
              string signature = current?.SignatureOrDefault ?? "";
              bool unchanged = ReferenceEquals(screen, _polledScreen) && signature == _polledSignature;
@@ -80,7 +96,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
              // Every tick, changed or not: a decision that just closed waits a
              // few ticks for its pick to land in the deck / relics / map.
              SimChoiceCapture.OnPoll(current, changed: !unchanged);
-@@ -636,11 +644,15 @@
+@@ -636,11 +646,15 @@
                  // the Python advisor's socket arriving, and the run sat on the
                  // first decision of the game indefinitely. The same hole swallows
                  // any advisor restart mid-run.
@@ -97,7 +113,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  }
                  return;
              }
-@@ -758,6 +770,7 @@
+@@ -758,6 +772,7 @@
          {
              return;
          }
@@ -105,7 +121,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
          ReportCombatEnded(round, roomType);
          DropInflight();
          SimHud.Instance.ClearAdvice();
-@@ -988,6 +1001,7 @@
+@@ -988,6 +1003,7 @@
 
      private void ScheduleAdvice()
      {
@@ -113,7 +129,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
          _lastBest = null; // board is (about to be) different; stale recommendation must not execute
          _lastScreen = null;
          // A peek is for one decision only: it hides once that is made.
-@@ -1331,7 +1345,7 @@
+@@ -1331,7 +1347,7 @@
              }
 
              CombatManager cm = CombatManager.Instance;
@@ -122,7 +138,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
              {
                  // Not a decision point; keep whatever advice is showing
                  // (mid-animation) -- staleness is handled by the events
-@@ -1429,6 +1443,10 @@
+@@ -1429,6 +1445,10 @@
              {
                  state["combat_log"] = combatLog;
                  state["capabilities"] = ModCapabilities();
@@ -133,7 +149,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  AddLanguage(state);
                  string brain = RequestedBrain;
                  state["brain"] = brain;
-@@ -1446,6 +1464,7 @@
+@@ -1446,6 +1466,7 @@
                      return;
                  }
 
@@ -141,7 +157,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  string? requestId = BridgeServer.Instance.SendAdviceRequest(json, OnAdviceReply);
                  if (requestId == null)
                  {
-@@ -1458,6 +1477,8 @@
+@@ -1458,6 +1479,8 @@
                  _inflightRequestId = requestId;
                  _inflightStateId = stateId;
                  _inflightEpoch = _positionEpoch;
@@ -150,7 +166,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  _inflightSignature = "";
                  _inflightBrain = brain;
                  ClearActedFrom();
-@@ -1575,6 +1596,7 @@
+@@ -1575,6 +1598,7 @@
                  return;
              }
 
@@ -158,7 +174,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
              string? requestId = BridgeServer.Instance.SendAdviceRequest(json, OnAdviceReply);
              if (requestId == null)
              {
-@@ -1588,6 +1610,8 @@
+@@ -1588,6 +1612,8 @@
              _inflightStateId = stateId;
              _inflightScreen = screen.Screen;
              _inflightEpoch = _positionEpoch;
@@ -167,7 +183,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
              _inflightSignature = screen.SignatureOrDefault;
              _inflightBrain = brain;
              ClearActedFrom();
-@@ -1705,6 +1729,7 @@
+@@ -1705,6 +1731,7 @@
                  ? s
                  : -1;
 
@@ -175,7 +191,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
              SimAdvice advice = root.TryGetProperty("advice", out JsonElement adviceEl)
                  ? SimAdvice.Parse(adviceEl)
                  : new SimAdvice();
-@@ -1748,6 +1773,14 @@
+@@ -1748,6 +1775,14 @@
                  bool samePosition = isCombat
                      ? _inflightEpoch == _positionEpoch
                      : ReferenceEquals(forScreen, _polledScreen) && forSignature == _polledSignature;
@@ -190,13 +206,13 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
                  _inflightRequestId = null;
                  _inflightStateId = -1;
                  _inflightScreen = null;
-@@ -3153,7 +3186,78 @@
+@@ -3153,7 +3188,78 @@
      /// <summary>`capabilities` this mod build advertises on every
      /// advice_request (PROTOCOL.md section 5): coach 2 = chips plus the v5.1
      /// recap / autopsy records.</summary>
 -    private static Dictionary<string, object> ModCapabilities() => new() { ["coach"] = 2 };
 +    private static Dictionary<string, object> ModCapabilities() =>
-+        new() { ["coach"] = 2, ["spiremind_lease"] = 1 };
++        new() { ["coach"] = 2, ["spiremind_lease"] = 1, ["spiremind_power_visibility"] = 1 };
 +
 +    private static string? ObserverKey(SimScreenDecision screen)
 +    {
@@ -270,6 +286,17 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
 
      /// <summary>`language` on the player's advice_request (PROTOCOL.md
      /// v5.4): "zh" while the mod shows Chinese (<see cref="L10n.IsZh"/>), so
+diff --git a/spire-mentor-mod/SimStateExtractor.cs b/spire-mentor-mod/SimStateExtractor.cs
+--- a/spire-mentor-mod/SimStateExtractor.cs
++++ b/spire-mentor-mod/SimStateExtractor.cs
+@@ -1336,6 +1336,7 @@
+             var d = new Dictionary<string, object?>
+             {
+                 ["id"] = power.Id.Entry,
++                ["observer_visible"] = power.IsVisible,
+                 ["name"] = power.Title.GetFormattedText(),
+                 ["amount"] = power.Amount,
+                 // `Amount` is not always the number the power runs on.
 diff --git a/spire-mentor-mod/SpireMindLease.cs b/spire-mentor-mod/SpireMindLease.cs
 new file mode 100644
 --- /dev/null

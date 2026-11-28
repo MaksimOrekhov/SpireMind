@@ -1,3 +1,4 @@
+mod diagnostics;
 mod engine;
 mod observation;
 mod session;
@@ -216,6 +217,7 @@ fn persist(dir: &Path, job: &Job) -> io::Result<()> {
 struct Live {
     latest: Mutex<Latest>,
     cache: Mutex<Option<CachedAdvice>>,
+    blocked_corpus: Mutex<Option<diagnostics::Corpus>>,
     wake: Condvar,
     terminal: Terminal,
     ttl: Duration,
@@ -254,6 +256,15 @@ impl Live {
                 ),
             };
             let mut result = decorate(value, &job.observation, job.position, "advisor_tcp");
+            if let Some(code) = result["error"]["code"].as_str() {
+                self.record_block(
+                    &job.observation.board,
+                    job.position,
+                    "engine",
+                    code,
+                    Some(&id),
+                );
+            }
             result["observation_id"] = json!(id);
             result["reused"] = json!(reused);
             {
@@ -269,6 +280,23 @@ impl Live {
             {
                 eprintln!("SpireMind: could not save sanitized observation");
             }
+        }
+    }
+
+    fn record_block(
+        &self,
+        raw: &Value,
+        p: Position,
+        phase: &'static str,
+        code: &str,
+        id: Option<&str>,
+    ) {
+        if let Some(corpus) = self.blocked_corpus.lock().unwrap().as_mut()
+            && corpus
+                .write(|| diagnostics::record(raw, p, phase, code, id))
+                .is_err()
+        {
+            eprintln!("SpireMind: could not save redacted blocker diagnostics");
         }
     }
 
@@ -410,6 +438,7 @@ impl Live {
                                     observation,
                                 }),
                                 Err(e) => {
+                                    self.record_block(&raw, p, "observation", e.code, None);
                                     let mut event = blocked(e);
                                     event["position"] = json!(p);
                                     event["context"] = json!(observation::context(&raw).ok());
@@ -439,6 +468,7 @@ pub fn run(
     ttl_ms: u64,
     json_output: bool,
     capture: Option<PathBuf>,
+    blocked_corpus: Option<PathBuf>,
     expected_build: &str,
 ) -> Result<()> {
     if let Some(path) = capture.as_deref() {
@@ -448,6 +478,17 @@ pub fn run(
     let live = Arc::new(Live {
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
+        blocked_corpus: Mutex::new(
+            blocked_corpus
+                .map(diagnostics::Corpus::new)
+                .transpose()
+                .map_err(|_| {
+                    Failure::new(
+                        "capture_io",
+                        "Blocked corpus must be a new writable directory",
+                    )
+                })?,
+        ),
         wake: Condvar::new(),
         terminal: Terminal {
             json: json_output || !io::stdout().is_terminal(),
@@ -492,7 +533,15 @@ fn read_capture(path: &Path) -> Result<Value> {
     if bytes.len() > MAX_FRAME {
         return Err(observation::schema("bounded capture size"));
     }
-    serde_json::from_slice(&bytes).map_err(|_| observation::schema("capture JSON"))
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| observation::schema("capture JSON"))?;
+    if value["kind"] == "blocked_diagnostic" {
+        return Err(Failure::new(
+            "diagnostic_not_replayable",
+            "A blocked diagnostic is not a validated observation",
+        ));
+    }
+    Ok(value)
 }
 
 pub use observation::live_build as check_version;

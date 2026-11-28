@@ -32,4 +32,8 @@ var withdrawal = Read(lease.Withdraw());
 Check(withdrawal.GetProperty("type").GetString() == "spiremind_withdraw", "withdrawal");
 Check(withdrawal.GetProperty("state_id").GetInt32() == 20, "withdrawn identity");
 Check(lease.Confirm(3, 9, screen, "map:rows") is null, "withdrawal cannot be revived");
+var combat = new SpireMindLease(3, "a9", 21, 12, null, "combat_action");
+Check(combat.Confirm(3, 12, null, "combat_action") is not null, "settled combat");
+Check(combat.Confirm(3, 13, null, "combat_action") is null, "combat epoch changed with the screen still open");
+Check(combat.Confirm(3, 12, null, null) is null, "combat actions disabled");
 Console.WriteLine("Observer lease checks passed");

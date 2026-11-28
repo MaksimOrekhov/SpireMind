@@ -132,7 +132,7 @@ fn stat_map(value: &Value, label: &str) -> Result<()> {
     }
 }
 
-fn card(value: &Value) -> Result<Value> {
+pub(super) fn card(value: &Value) -> Result<Value> {
     let c = object(
         value,
         "id name index upgrade_level upgraded cost base_cost persistent_cost played_cost stable_cost effective_cost costs_x type target_type exhaust innate retain ethereal will_exhaust will_retain sly sly_this_turn stats affliction affliction_stacks enchantment enchantment_amount playable unplayable_reason valid_target_indices base_replay_count star_cost persistent_star_cost",
@@ -199,7 +199,7 @@ fn card(value: &Value) -> Result<Value> {
     Ok(c)
 }
 
-fn relic(value: &Value) -> Result<Value> {
+pub(super) fn relic(value: &Value) -> Result<Value> {
     let r = object(
         value,
         "id name counter stack_count is_wax is_melted status",
@@ -223,7 +223,7 @@ fn relic(value: &Value) -> Result<Value> {
     Ok(r)
 }
 
-fn potion(value: &Value) -> Result<Value> {
+pub(super) fn potion(value: &Value) -> Result<Value> {
     let p = object(
         value,
         "slot empty id name usage can_use target_type requires_target",
@@ -244,11 +244,22 @@ fn potion(value: &Value) -> Result<Value> {
     Ok(p)
 }
 
-fn power(value: &Value) -> Result<Value> {
+pub(super) fn power(value: &Value) -> Result<Value> {
+    if let Some(visibility) = value.get("observer_visible") {
+        if visibility == false {
+            return Err(Failure::new(
+                "unsupported_mechanic",
+                "Power visibility was not confirmed",
+            ));
+        }
+        if visibility != true {
+            return Err(schema("power visibility"));
+        }
+    }
     let p = object(
         value,
         "id name amount display_amount",
-        "description type stack_type target applier player_target vars instance_id",
+        "description type stack_type target applier player_target vars instance_id observer_visible",
         "power",
     )?;
     string(&p, "id")?;
@@ -291,7 +302,7 @@ fn power(value: &Value) -> Result<Value> {
     Ok(p)
 }
 
-fn intent(value: &Value) -> Result<Value> {
+pub(super) fn intent(value: &Value) -> Result<Value> {
     let i = object(
         value,
         "kind intent_type damage hits total_damage",
@@ -310,8 +321,8 @@ fn intent(value: &Value) -> Result<Value> {
     Ok(i)
 }
 
-fn enemy(value: &Value) -> Result<Value> {
-    let mut e = object(
+pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
+    let e = object(
         value,
         "id name combat_id hp max_hp block is_alive is_hittable slot slot_name powers intents",
         "side is_player is_monster next_move_id move_state move_history ai forecast fabricator_last_spawned curse_of_knowledge_counter",
@@ -339,6 +350,11 @@ fn enemy(value: &Value) -> Result<Value> {
             "A living enemy is temporarily untargetable",
         ));
     }
+    Ok(e)
+}
+
+fn enemy(value: &Value) -> Result<Value> {
+    let mut e = enemy_envelope(value)?;
     e["powers"] = map_list(list(&e, "powers", 64)?, power)?;
     e["intents"] = map_list(list(&e, "intents", 8)?, intent)?;
     Ok(e)
@@ -482,6 +498,12 @@ pub fn context(value: &Value) -> Result<Context> {
 }
 
 pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
+    if context == Context::CardReward && (!raw["surface"].is_null() || !raw["combat"].is_null()) {
+        return Err(Failure::new(
+            "unsupported_state",
+            "Only the normal card reward screen is supported",
+        ));
+    }
     let mut b = object(
         raw,
         "type advice_for state_id request_id game_version mod_version player_count act act_name floor current_room run_state map surface nodes cards can_skip player hand draw_pile discard_pile exhaust_pile play_pile draw_pile_count discard_pile_count exhaust_pile_count enemies potions available_actions round room_type encounter_id allies orbs orb_capacity pets combat turn",
@@ -628,12 +650,6 @@ pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
             }
         }
         Context::CardReward => {
-            if !b["surface"].is_null() || !b["combat"].is_null() {
-                return Err(Failure::new(
-                    "unsupported_state",
-                    "Only the normal card reward screen is supported",
-                ));
-            }
             string(&b, "current_room")?;
             boolean(&b, "can_skip")?;
             b["cards"] = map_list(list(&b, "cards", 16)?, |c| {
