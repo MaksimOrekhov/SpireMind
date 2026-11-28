@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value, json};
 
+use super::powers::{self, Owner};
 use crate::{Failure, Result, contract::Context};
 
 pub const MOD: &str = "0.11.10";
@@ -244,7 +245,7 @@ pub(super) fn potion(value: &Value) -> Result<Value> {
     Ok(p)
 }
 
-pub(super) fn power(value: &Value) -> Result<Value> {
+pub(super) fn power(value: &Value, owner: Owner) -> Result<Value> {
     if let Some(visibility) = value.get("observer_visible") {
         if visibility == false {
             return Err(Failure::new(
@@ -271,35 +272,19 @@ pub(super) fn power(value: &Value) -> Result<Value> {
         return Err(schema("power amount"));
     }
     ints(&p, "display_amount", -10_000..=10_000)?;
-    // Upstream serializes private counters in vars for some powers. Only powers
-    // expressible by their shown amount enter this stateless rebuild.
-    let id = p["id"].as_str().unwrap();
-    let id = id.strip_suffix("_POWER").unwrap_or(id);
-    if !matches!(
-        id,
-        "STRENGTH"
-            | "DEXTERITY"
-            | "VULNERABLE"
-            | "WEAK"
-            | "FRAIL"
-            | "ARTIFACT"
-            | "RITUAL"
-            | "THORNS"
-            | "METALLICIZE"
-            | "CURL_UP"
-            | "ANGRY"
-            | "INTANGIBLE"
-            | "BUFFER"
-            | "PLATED_ARMOR"
-            | "ENTANGLED"
-            | "VIGOR"
-    ) {
+    // Never pass raw counters or dynamic vars through to the importer.
+    powers::validate(&p, owner)?;
+    Ok(p)
+}
+
+pub(super) fn live_power(value: &Value, owner: Owner) -> Result<Value> {
+    if !value["observer_visible"].is_boolean() {
         return Err(Failure::new(
-            "unsupported_mechanic",
-            "Power is outside the audited amount-only set",
+            "power_visibility_unverified",
+            "Live effects require a boolean observer_visible marker",
         ));
     }
-    Ok(p)
+    power(value, owner)
 }
 
 pub(super) fn intent(value: &Value) -> Result<Value> {
@@ -353,9 +338,9 @@ pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
     Ok(e)
 }
 
-fn enemy(value: &Value) -> Result<Value> {
+fn enemy(value: &Value, validate_power: fn(&Value, Owner) -> Result<Value>) -> Result<Value> {
     let mut e = enemy_envelope(value)?;
-    e["powers"] = map_list(list(&e, "powers", 64)?, power)?;
+    e["powers"] = map_list(list(&e, "powers", 64)?, |p| validate_power(p, Owner::Enemy))?;
     e["intents"] = map_list(list(&e, "intents", 8)?, intent)?;
     Ok(e)
 }
@@ -498,6 +483,29 @@ pub fn context(value: &Value) -> Result<Context> {
 }
 
 pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
+    project(raw, context, power)
+}
+
+pub(super) fn sanitize_live(raw: &Value, context: Context) -> Result<Observation> {
+    confirm_power_capability(raw)?;
+    project(raw, context, live_power)
+}
+
+pub(super) fn confirm_power_capability(raw: &Value) -> Result<()> {
+    if raw["capabilities"]["spiremind_power_visibility"] != 1 {
+        return Err(Failure::new(
+            "power_visibility_not_supported",
+            "Install the pinned SpireMind observer with power visibility before using live",
+        ));
+    }
+    Ok(())
+}
+
+fn project(
+    raw: &Value,
+    context: Context,
+    validate_power: fn(&Value, Owner) -> Result<Value>,
+) -> Result<Observation> {
     if context == Context::CardReward && (!raw["surface"].is_null() || !raw["combat"].is_null()) {
         return Err(Failure::new(
             "unsupported_state",
@@ -584,7 +592,9 @@ pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
             ] {
                 ints(&p, name, 0..=100_000)?;
             }
-            p["powers"] = map_list(list(&p, "powers", 64)?, power)?;
+            p["powers"] = map_list(list(&p, "powers", 64)?, |p| {
+                validate_power(p, Owner::Player)
+            })?;
             if p.get("powered_hits_this_turn").is_some() {
                 p["powered_hits_this_turn"] =
                     map_list(list(&p, "powered_hits_this_turn", 32)?, |hit| {
@@ -638,7 +648,7 @@ pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
                 }
                 b[pile] = json!({"cards":cards,"count":cards.len()});
             }
-            b["enemies"] = map_list(list(&b, "enemies", 32)?, enemy)?;
+            b["enemies"] = map_list(list(&b, "enemies", 32)?, |e| enemy(e, validate_power))?;
             b["potions"] = map_list(list(&b, "potions", 16)?, potion)?;
             let available = list(&b, "available_actions", 4)?;
             if !available.contains(&json!("END_TURN"))

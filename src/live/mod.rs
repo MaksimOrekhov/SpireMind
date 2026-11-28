@@ -1,7 +1,10 @@
+pub(crate) mod compatibility;
 mod diagnostics;
 mod engine;
 mod observation;
+mod powers;
 mod session;
+mod sim_observation;
 #[cfg(test)]
 mod tests;
 mod transport;
@@ -194,7 +197,11 @@ fn decorate(mut event: Value, obs: &Observation, p: Position, source: &str) -> V
     event["ascension"] = obs.board["run_state"]["ascension"].clone();
     event["model"] = json!(model::pin());
     event["upstream_revision"] = json!(model::REVISION);
-    event["observation"] = json!(model::OBSERVATION);
+    event["observation"] = json!(if obs.context == crate::contract::Context::Combat {
+        model::OBSERVED_COMBAT
+    } else {
+        model::OBSERVATION
+    });
     event
 }
 
@@ -423,6 +430,7 @@ impl Live {
                                     "Install the pinned SpireMind observer patch before using live",
                                 ));
                             }
+                            observation::confirm_power_capability(&raw)?;
                             self.begin(p, at);
                             // A screen request remains in flight without this reply.
                             // The Ack has no best, options, gameplay fields or score.

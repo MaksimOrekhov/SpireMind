@@ -358,7 +358,7 @@ fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
     Ok(())
 }
 
-fn reconstruct(obs: &Observation) -> Result<RunManager> {
+pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
     let mut board = obs.board.clone();
     if board["map"].is_null() {
         return Err(Failure::new(
@@ -461,14 +461,30 @@ pub fn advise(net: &E2eNet, obs: &Observation) -> Result<Value> {
         return Ok(result);
     }
     let mut rm = reconstruct(obs)?;
-    let screen = screen_actions(obs, &rm)?;
+    let (rows, actions) = checked_actions(obs, &rm)?;
+    if actions.len() == 1 {
+        return Ok(json!({"status":"forced","legal_actions":actions,"forced_action_id":0}));
+    }
+    let decision = checked_decision(obs, &mut rm, &rows)?;
+    let (logits, forward) = if obs.context == Context::Combat {
+        let row = model::observed_combat_row(net, &decision, &rm)?;
+        model::forward(net, &decision, &row)?
+    } else {
+        model::infer(net, &decision, &rm, &mut TokCache::new())?
+    };
+    let ranked = contract::rank(&decision.classes, &decision.members, &logits)?;
+    Ok(json!({"status":"ok","legal_actions":actions,"recommendations":ranked,"forward_ms":forward}))
+}
+
+pub(super) fn checked_actions(obs: &Observation, rm: &RunManager) -> Result<(Value, Vec<Value>)> {
+    let screen = screen_actions(obs, rm)?;
     let engine = match obs.context {
         Context::Combat => emit::legal_actions(
             rm.combat
                 .as_ref()
                 .ok_or_else(|| rebuild("Missing combat after graft"))?,
         ),
-        _ => run_wire::available_actions(&rm),
+        _ => run_wire::available_actions(rm),
     };
     let rows = engine
         .as_array()
@@ -487,22 +503,27 @@ pub fn advise(net: &E2eNet, obs: &Observation) -> Result<Value> {
         .enumerate()
         .map(|(i, key)| json!({"action_id":i,"action":screen[key]}))
         .collect::<Vec<_>>();
-    if actions.len() == 1 {
-        return Ok(json!({"status":"forced","legal_actions":actions,"forced_action_id":0}));
-    }
-    let Next::Decision(decision) = Driver::new(0).peek(&mut rm) else {
+    Ok((engine, actions))
+}
+
+pub(super) fn checked_decision(
+    obs: &Observation,
+    rm: &mut RunManager,
+    rows: &Value,
+) -> Result<Box<sts2_e2e::env::Decision>> {
+    let Next::Decision(decision) = Driver::new(0).peek(rm) else {
         return Err(coverage(
             "Upstream did not expose a scored decision for the full action set",
         ));
     };
-    if Context::from_dtype(decision.dtype).ok() != Some(obs.context) || &decision.actions != rows {
+    if Context::from_dtype(decision.dtype).ok() != Some(obs.context)
+        || rows.as_array() != Some(&decision.actions)
+    {
         return Err(coverage(
             "Model decision and visible game action sets differ",
         ));
     }
-    let (logits, forward) = model::infer(net, &decision, &rm, &mut TokCache::new())?;
-    let ranked = contract::rank(&decision.classes, &decision.members, &logits)?;
-    Ok(json!({"status":"ok","legal_actions":actions,"recommendations":ranked,"forward_ms":forward}))
+    Ok(decision)
 }
 
 fn entrance_action(obs: &Observation) -> Result<Option<Value>> {

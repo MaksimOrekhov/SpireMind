@@ -184,7 +184,7 @@ impl Session {
     }
 
     pub fn observe(&mut self, raw: &Value, position: Position) -> Result<Observation> {
-        let mut observation = observation::sanitize(raw, observation::context(raw)?)?;
+        let mut observation = observation::sanitize_live(raw, observation::context(raw)?)?;
         self.attach_map(&mut observation, position)?;
         Ok(observation)
     }

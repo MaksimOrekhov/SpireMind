@@ -61,6 +61,8 @@ $snapshots = @(Get-ChildItem .local/live-captures -Filter 'advisor-*.json' | Sel
 python scripts/live_metrics.py .local/live-captures/events.jsonl --captures .local/live-captures
 ```
 
-Для разбора блокировок добавьте к запуску `live` параметр `--blocked-corpus .local/blocked-a0`. Укажите новый каталог. Он хранит ограниченный объём санитизированной диагностики, которую можно свести командой `python scripts/coverage_panel.py blockers .local/blocked-a0`. Расширение `observer-visibility-1` позволяет диагностике указать распознанный ID эффекта, если игра подтверждает его видимость. [Разбор боевого покрытия и офлайн-сравнение](docs/research/live-results.md#аудит-боевого-покрытия-после-второго-ревью)
+Для live требуется сборка наблюдателя с `spiremind_power_visibility=1`. Каждый боевой эффект должен содержать булев маркер `observer_visible`. Совместимость старых санитизированных снимков сохраняется в `replay`.
+
+Для разбора блокировок добавьте к запуску `live` параметр `--blocked-corpus .local/blocked-a0`. Укажите новый каталог. Команда `python scripts/coverage_panel.py blockers .local/blocked-a0` ранжирует санитизированные причины отказов. ID эффекта указан, если игра подтвердила его видимость и он найден в закреплённом реестре. `spiremind compatibility` запускает отдельный офлайн-набор с исходным движком и весами Instinct. [Таблица эффектов и результаты](docs/research/combat-compatibility.md)
 
 Остановите CLI через `Ctrl+C`. Чтобы отключить мод, переведите его в режим **Off** или выключите в меню модов. Для отката ручной установки закройте игру и вынесите папку `mods/SpireMentor` из каталога игры. `mods/BaseLib` оставьте, если она нужна другим модам. Для Workshop-установки отпишитесь от Spire Mentor. [ADR live bridge](docs/adr/0002-live-bridge.md)

@@ -60,6 +60,18 @@ enum Mode {
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
         timeout_seconds: u64,
     },
+    /// Compare simulator-derived public combat positions and original Instinct.
+    Compatibility {
+        #[arg(long, default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=32))]
+        runs: u8,
+        #[arg(long, default_value_t = 160, value_parser = clap::value_parser!(u32).range(10..=1500))]
+        steps_per_run: u32,
+        /// Compare reconstructions without loading model weights.
+        #[arg(long)]
+        structural_only: bool,
+    },
+    /// List observation compatibility for the pinned upstream power registry.
+    PowerMatrix,
     /// Show read-only recommendations from Spire Mentor's local Advisor lane.
     Live {
         #[arg(long, default_value_t = 9002, value_parser = clap::value_parser!(u16).range(1..))]
@@ -104,7 +116,25 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
     if let Mode::Sanitize { input, output } = &cli.command {
         return Ok((live::sanitize_file(input, output)?, true));
     }
-    if matches!(cli.command, Mode::Recommend { .. } | Mode::Benchmark { .. }) {
+    if matches!(cli.command, Mode::PowerMatrix) {
+        return Ok((live::compatibility::power_matrix(), true));
+    }
+    if let Mode::Compatibility {
+        runs,
+        steps_per_run,
+        structural_only: true,
+    } = cli.command
+    {
+        model::check_build(cli.game_version.as_deref().unwrap_or(BUILD.as_str()))?;
+        return Ok((
+            live::compatibility::run(None, runs, steps_per_run as usize)?,
+            true,
+        ));
+    }
+    if matches!(
+        cli.command,
+        Mode::Recommend { .. } | Mode::Benchmark { .. } | Mode::Compatibility { .. }
+    ) {
         model::check_build(cli.game_version.as_deref().unwrap_or(BUILD.as_str()))?;
     }
     let path = cli.weights.unwrap_or_else(model::default_weights);
@@ -122,6 +152,14 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             runs,
             timeout_seconds,
         } => Ok(simulation::benchmark(&net, runs, timeout_seconds)),
+        Mode::Compatibility {
+            runs,
+            steps_per_run,
+            ..
+        } => Ok((
+            live::compatibility::run(Some(&net), runs, steps_per_run as usize)?,
+            true,
+        )),
         Mode::Live {
             port,
             ttl_ms,
@@ -152,7 +190,7 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             Ok((json!({"status":"stopped"}), true))
         }
         Mode::Replay { captures } => live::replay(&net, &captures),
-        Mode::Sanitize { .. } => unreachable!(),
+        Mode::Sanitize { .. } | Mode::PowerMatrix => unreachable!(),
     }
 }
 

@@ -1,11 +1,13 @@
 use std::{fs, io, path::PathBuf};
 
+use super::{
+    observation,
+    powers::{self, Owner},
+    session::Position,
+};
+use crate::{contract::Context, model};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use sts2_core::PowerKind;
-
-use super::{observation, session::Position};
-use crate::{contract::Context, model};
 
 const MAX_RECORDS: usize = 256;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -73,12 +75,7 @@ fn public_power_id(v: &Value) -> Option<&'static str> {
     if v["observer_visible"] != true {
         return None;
     }
-    let id = id(&v["id"])?;
-    let id = id.strip_suffix("_POWER").unwrap_or(id);
-    PowerKind::all()
-        .iter()
-        .map(|kind| kind.python_name())
-        .find(|&name| name.eq_ignore_ascii_case(id))
+    Some(powers::registry_id(id(&v["id"])?)?.python_name())
 }
 
 fn kind(v: &Value) -> &'static str {
@@ -115,7 +112,7 @@ impl Projection {
         item_id: Option<&str>,
         keys: &[&str],
         why: &'static str,
-        validate: fn(&Value) -> crate::Result<Value>,
+        validate: impl FnOnce(&Value) -> crate::Result<Value>,
     ) {
         if let Err(error) = validate(row) {
             if self.blockers.len() == MAX_BLOCKERS {
@@ -124,7 +121,9 @@ impl Projection {
             }
             self.blockers.push(json!({
                 "path": path, "id": item_id, "code": error.code,
-                "reason": if error.code == "unsupported_mechanic" { why } else { "invalid_shape" },
+                "reason": if matches!(error.code, "unsupported_mechanic" | "power_visibility_unverified" | "power_public_parameter") {
+                    why
+                } else { "invalid_shape" },
                 "field_types": field_types(row, keys)
             }));
         }
@@ -159,7 +158,7 @@ impl Projection {
             .collect()
     }
 
-    fn powers(&mut self, value: &Value, path: &str) -> Vec<Value> {
+    fn powers(&mut self, value: &Value, path: &str, owner: Owner) -> Vec<Value> {
         rows(value, 64)
             .iter()
             .enumerate()
@@ -168,6 +167,11 @@ impl Projection {
                     .visibility_marker
                     .then(|| public_power_id(power))
                     .flatten();
+                let check = if self.visibility_marker {
+                    observation::live_power
+                } else {
+                    observation::power
+                };
                 self.check(
                     power,
                     format!("{path}[{i}]"),
@@ -183,7 +187,7 @@ impl Projection {
                         (true, Value::Bool(false), _) => "hidden_power",
                         _ => "unverified_power_visibility",
                     },
-                    observation::power,
+                    |row| check(row, owner),
                 );
                 // An unverified power contributes no value or identifier to the public fingerprint.
                 public_id.map(|id| json!([id, integer(&power["display_amount"])]))
@@ -199,7 +203,7 @@ impl Projection {
         // The draw pile contributes its public size only. Its contents and
         // array indices are deliberately neither traversed nor logged here.
         let player = &raw["player"];
-        let player_powers = self.powers(&player["powers"], "$.player.powers");
+        let player_powers = self.powers(&player["powers"], "$.player.powers", Owner::Player);
         let enemies: Vec<_> = rows(&raw["enemies"], 32)
             .iter()
             .enumerate()
@@ -214,7 +218,7 @@ impl Projection {
                     "enemy_needs_audit",
                     observation::enemy_envelope,
                 );
-                let powers = self.powers(&enemy["powers"], &format!("{path}.powers"));
+                let powers = self.powers(&enemy["powers"], &format!("{path}.powers"), Owner::Enemy);
                 let intents: Vec<_> = rows(&enemy["intents"], 8)
                     .iter()
                     .enumerate()

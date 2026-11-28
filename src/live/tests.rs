@@ -38,6 +38,7 @@ fn base(context: Context) -> Value {
         "type":"advice_request","request_id":"a4","state_id":11,"advice_for":screen,
         "game_version":"v0.111.1","mod_version":"0.11.10",
         "player_count":1,"act":1,"act_name":"Overgrowth","floor":if on_map {0}else{1},
+        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1},
         "current_room":if on_map {"Map"}else{"Monster"},
         "seed":"ignored","rng":{"run_seed": 512, "counters":{"shuffle":999}}, "brain":"instinct",
         "run_state":{"character":"IRONCLAD","game_mode":"standard","ascension":0,"hp":70,"max_hp":80,"gold":99,"potion_slot_count":2,
@@ -195,6 +196,110 @@ fn synthetic_generated_choice_does_not_become_a_deck_reward() {
         sanitize(&raw, Context::CardReward).err().unwrap().code,
         "unsupported_state"
     );
+}
+
+#[test]
+fn live_requires_visibility_while_legacy_replay_keeps_supported_effects() {
+    let mut raw = base(Context::Combat);
+    let rank = json!({"id":"STRENGTH_POWER","name":"Strength","amount":2,"display_amount":2});
+    raw["player"]["powers"] = json!([rank.clone()]);
+    raw["enemies"][0]["powers"] = json!([rank]);
+    let live_code = |b: &Value| {
+        observation::sanitize_live(b, Context::Combat)
+            .err()
+            .unwrap()
+            .code
+    };
+    assert!(sanitize(&raw, Context::Combat).is_ok());
+    assert_eq!(live_code(&raw), "power_visibility_unverified");
+    raw["player"]["powers"][0]["observer_visible"] = json!(true);
+    raw["enemies"][0]["powers"][0]["observer_visible"] = json!("true");
+    assert_eq!(live_code(&raw), "power_visibility_unverified");
+    raw["enemies"][0]["powers"][0]["observer_visible"] = json!(false);
+    assert_eq!(live_code(&raw), "unsupported_mechanic");
+    raw["enemies"][0]["powers"][0]["observer_visible"] = json!(true);
+    let board = observation::sanitize_live(&raw, Context::Combat)
+        .unwrap()
+        .board;
+    assert_eq!(board, sanitize(&board, Context::Combat).unwrap().board);
+    raw["capabilities"]["spiremind_power_visibility"] = json!(true);
+    assert_eq!(live_code(&raw), "power_visibility_not_supported");
+    raw["capabilities"]
+        .as_object_mut()
+        .unwrap()
+        .remove("spiremind_power_visibility");
+    assert_eq!(live_code(&raw), "power_visibility_not_supported");
+}
+
+#[test]
+fn synthetic_slow_uses_only_the_public_counter_carrier() {
+    use super::powers::Owner;
+    let mut row = json!({"id":"SLOW_POWER","name":"Slow","amount":1,"display_amount":20,
+        "observer_visible":true,"vars":{"SlowAmount":2}});
+    let projected = observation::live_power(&row, Owner::Enemy).unwrap();
+    row["vars"]["SlowAmount"] = json!(813);
+    assert_eq!(
+        projected,
+        observation::live_power(&row, Owner::Enemy).unwrap()
+    );
+    assert!(projected.get("vars").is_none());
+    assert!(observation::live_power(&row, Owner::Player).is_err());
+    row["display_amount"] = json!(23);
+    assert_eq!(
+        observation::live_power(&row, Owner::Enemy)
+            .unwrap_err()
+            .code,
+        "power_public_parameter"
+    );
+    row.as_object_mut().unwrap().remove("display_amount");
+    assert!(observation::live_power(&row, Owner::Enemy).is_err());
+}
+
+#[test]
+fn simulator_compatibility_structural_suite() {
+    let result = super::compatibility::run(None, 1, 95).unwrap();
+    assert_eq!(result["campaign"]["source"], "simulator_derived");
+    assert_eq!(result["campaign"]["live_validate_count"], 0);
+    assert_eq!(
+        result["campaign"]["parity_checks"]["same_public_projection_after_redeal"],
+        8
+    );
+    assert!(result["campaign"]["unique"].as_u64().unwrap() >= 20);
+    assert!(
+        result["campaign"]["outcomes"]["structural_ok"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let targeted = &result["configured_fights"]["CORPSE_SLUGS_NORMAL"];
+    assert!(targeted["multiple_enemies"].as_u64().unwrap() > 0);
+    assert!(targeted["modified_cards"].as_u64().unwrap() > 0);
+    assert_eq!(
+        targeted["parity_checks"]["same_public_projection_after_redeal"],
+        8
+    );
+}
+
+#[test]
+#[ignore = "requires the pinned Instinct weights"]
+fn compatibility_model_smoke_simulator_policy_parity() {
+    let net = model::load(&model::default_weights()).unwrap();
+    let result = super::compatibility::run(Some(&net), 1, 95).unwrap();
+    let campaign = &result["campaign"];
+    assert!(
+        campaign["parity_checks"]["exact_masked_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(
+        campaign["parity_checks"]["logits_within_1e_5"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert!(campaign["outcomes"]["ok"].as_u64().unwrap() > 0);
+    assert_eq!(campaign["live_validate_count"], 0);
 }
 
 #[test]
@@ -432,6 +537,7 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     );
     assert!(duplex.output.is_empty());
     let mut advisor = base(Context::Map);
+    advisor.as_object_mut().unwrap().remove("capabilities");
     duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
     assert_eq!(
         live.serve(&mut duplex, 1, "v0.111.1").unwrap_err().code,
@@ -439,6 +545,13 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     );
     assert!(duplex.output.is_empty());
     advisor["capabilities"] = json!({"spiremind_lease":1});
+    duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
+    assert_eq!(
+        live.serve(&mut duplex, 1, "v0.111.1").unwrap_err().code,
+        "power_visibility_not_supported"
+    );
+    assert!(duplex.output.is_empty());
+    advisor["capabilities"] = json!({"spiremind_lease":1,"spiremind_power_visibility":1});
     advisor["advice_for"] = json!("shop");
     duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
     live.serve(&mut duplex, 1, "v0.111.1").unwrap();

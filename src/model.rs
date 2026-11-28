@@ -11,7 +11,7 @@ use sts2_core::{GameVersion, run_manager::RunManager};
 use sts2_e2e::{
     env::Decision,
     net::{E2eNet, PolicyRow},
-    schema::{N_CAT, N_CONT, xc, xf},
+    schema::{N_CAT, N_CONT, sc, sec, slot, xc, xf},
     tokens::{TokCache, TokRow, encode_for, without_row_dump},
 };
 
@@ -21,6 +21,7 @@ pub const BUILD: GameVersion = GameVersion::V0_111_0;
 pub const ASCENSION: u8 = 10;
 pub const REVISION: &str = env!("SPIRE_MENTOR_REV");
 pub const OBSERVATION: &str = "upstream-policy-without-enemy-forecast-v1";
+pub const OBSERVED_COMBAT: &str = "upstream-policy-visible-combat-telegraphs-v2";
 
 #[derive(Deserialize, Serialize)]
 pub struct ModelPin {
@@ -121,9 +122,39 @@ pub fn infer(
     cache: &mut TokCache,
 ) -> Result<(Vec<f32>, f64)> {
     let row: PolicyRow = policy_tokens(net, d, rm, cache)?.into();
+    forward(net, d, &row)
+}
+
+pub fn observed_combat_row(net: &E2eNet, d: &Decision, rm: &RunManager) -> Result<PolicyRow> {
+    let mut tokens = policy_tokens(net, d, rm, &mut TokCache::new())?;
+    for (i, continuous) in tokens
+        .cont
+        .as_chunks_mut::<N_CONT>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        if tokens.sec[i] != const { sec("ENEMY") } {
+            continue;
+        }
+        // The UI shows effective attack damage and hit count. It does
+        // not supply the engine's base attack amount or internal numbers
+        // attached to non-attack icons.
+        continuous[const { sc("E_AMT") }] = 0;
+        if continuous[const { sc("E_ALIVE") }] == 0 {
+            // A corpse can retain its former engine intent while the
+            // player has no current telegraph for it.
+            tokens.cat[i * N_CAT + const { slot("intent") }] = 0;
+            continuous[const { sc("E_EFF") }..=const { sc("E_TOT") }].fill(0);
+        }
+    }
+    Ok(tokens.into())
+}
+
+pub fn forward(net: &E2eNet, d: &Decision, row: &PolicyRow) -> Result<(Vec<f32>, f64)> {
     let start = Instant::now();
     let logits = net
-        .try_logits(&row)
+        .try_logits(row)
         .map_err(|e| Failure::new("inference", e))?;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
     validate_logits(d.members.len(), &logits)?;

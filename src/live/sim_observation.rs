@@ -1,0 +1,286 @@
+//! Test-suite projection of the simulator's public combat surface.
+//! This module has no access to the live connection.
+use serde_json::{Value, json};
+use sts2_core::{
+    Card, CombatState, card_by_uid,
+    cards::{TargetType, effective_target_type},
+    creature_by_id, potion_effects,
+    potions::PotionTargetType,
+    run_manager::RunManager,
+};
+use sts2_e2e::snapshot;
+use sts2_wire::emit::{self, run_manager as run_wire};
+
+use crate::{Failure, Result, model::BUILD};
+
+fn projection(message: &str) -> Failure {
+    Failure::new("sim_projection", message)
+}
+
+fn card_model(c: &Card) -> Value {
+    let id = c.card_id.to_python_name();
+    let mut result = json!({"id":id,"name":id,"upgrade_level":c.upgrade_level()});
+    if let Some((enchantment, amount)) = run_wire::card_enchantment(&c.enchantments) {
+        result["enchantment"] = json!(enchantment);
+        result["enchantment_amount"] = json!(amount);
+    }
+    result
+}
+
+fn combat_card(cs: &CombatState, c: &Card, wire: &Value) -> Value {
+    let mut result = card_model(c);
+    result["type"] = json!(format!("{:?}", c.card_type));
+    result["target_type"] = json!(match effective_target_type(cs, c) {
+        TargetType::Enemy => "AnyEnemy",
+        TargetType::AllEnemies => "AllEnemies",
+        TargetType::Self_ => "Self",
+        TargetType::None => "None",
+        TargetType::Random => "RandomEnemy",
+    });
+    result["base_cost"] = wire["base_cost"].clone();
+    result["cost"] = wire["cost_override"].clone();
+    result["effective_cost"] = wire["cost_override"].clone();
+    for key in ["affliction", "affliction_stacks", "base_replay_count"] {
+        if let Some(value) = wire.get(key) {
+            result[key] = value.clone();
+        }
+    }
+    if wire.get("combat_vars").is_some() {
+        // Signal a required per-instance field. Its raw values are private.
+        result["combat_vars"] = json!({});
+    }
+    if let Some(flags) = wire["flags"].as_array() {
+        for key in ["ethereal", "innate", "retain"] {
+            if flags.iter().any(|v| v == key) {
+                result[key] = json!(true);
+            }
+        }
+    }
+    result
+}
+
+fn powers(wire: &Value) -> Vec<Value> {
+    rows(wire)
+        .iter()
+        .map(|p| {
+            json!({
+                "id":p["name"],"name":p["name"],"amount":p["amount"],
+                "display_amount":p["display_amount"],"observer_visible":true
+            })
+        })
+        .collect()
+}
+
+fn rows(wire: &Value) -> &[Value] {
+    wire.as_array().map_or(&[], Vec::as_slice)
+}
+
+fn map(rm: &RunManager) -> Result<Value> {
+    let run = &rm.run_state;
+    let full = run_wire::full_map(rm);
+    let graph = run
+        .current_act_map
+        .as_ref()
+        .ok_or_else(|| projection("No map"))?;
+    let point = |v: &Value| json!({"col":v["col"], "row":v["row"], "id":v["id"]});
+    let boss = &full["boss"];
+    let boss_row = boss["row"]
+        .as_i64()
+        .ok_or_else(|| projection("No visible boss"))?;
+    let nodes = rows(&full["rows"])
+        .iter()
+        .flat_map(rows)
+        .filter(|n| n["type"] != "Boss")
+        .map(|n| json!({"col":n["col"],"row":n["row"],"type":n["type"],"children":n["children"]}))
+        .collect::<Vec<_>>();
+    let visited = run
+        .visited_map_coords
+        .iter()
+        .map(|p| json!({"col":p.col,"row":p.row}))
+        .collect::<Vec<_>>();
+    let columns = graph.grid.keys().map(|p| p.col).max().unwrap_or(6) + 1;
+    Ok(json!({
+        "current":full["current_coord"],"boss":point(boss),
+        "row_count":boss_row+1,"col_count":columns,"nodes":nodes,"visited":visited
+    }))
+}
+
+pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
+    let cs = rm.combat.as_ref().ok_or_else(|| projection("No combat"))?;
+    // Upstream belief view removes the unknown draw order and redeals RNG.
+    // Only an explicit public projection of its wire leaves this function.
+    let cs = snapshot::belief_view(cs);
+    let wire =
+        snapshot::state_dict(&cs).map_err(|_| projection("Simulator state export failed"))?;
+    let telegraphs = emit::combat::enemy_telegraphs(&cs)
+        .map_err(|_| projection("Simulator telegraph export failed"))?;
+    let run = &rm.run_state;
+    let player = &wire["player"];
+    let mut public_player = json!({
+        "hp":player["hp"],"max_hp":player["max_hp"],"energy":player["energy"],
+        "max_energy":player["max_energy"],"block":player["block"],"powers":powers(&player["powers"]),
+        "cards_played_this_turn":[0,0,0,0,0]
+    });
+    for field in [
+        "cards_played_this_turn",
+        "bound_card_played_this_turn",
+        "hp_lost_this_turn",
+        "unblocked_hits_this_combat",
+        "powered_hits_this_turn",
+        "cards_exhausted_this_combat",
+        "cards_exhausted_this_turn",
+        "card_block_gains_this_turn",
+        "discards_this_turn",
+        "cards_drawn_this_combat",
+        "cards_generated_this_combat",
+        "extra_turns_taken_this_combat",
+    ] {
+        if let Some(v) = player.get(field) {
+            public_player[field] = v.clone();
+        }
+    }
+    let belt = (0..run.potion_belt_cap())
+        .map(|slot| {
+            let Some(p) = cs.player.potions.get(slot).copied() else {
+                return json!({"slot":slot,"empty":true});
+            };
+            let target = match potion_effects::lookup_target_type(p) {
+                Some(PotionTargetType::Self_) => "Self",
+                Some(PotionTargetType::AnyEnemy) => "AnyEnemy",
+                Some(PotionTargetType::AllEnemies) => "AllEnemies",
+                Some(PotionTargetType::AnyPlayer) => "AnyPlayer",
+                None => "Unknown",
+            };
+            let usable = rows(actions).iter().any(|a| a["slot"] == slot && matches!(a["action"].as_str(), Some("potion" | "drink_potion")));
+            json!({"slot":slot,"empty":false,"id":p.python_name(),"name":p.python_name(),"usage":"CombatOnly",
+                "can_use":usable,"target_type":target,"requires_target":target=="AnyEnemy"})
+        })
+        .collect::<Vec<_>>();
+    let relics = run
+        .relics
+        .iter()
+        .map(|kind| {
+            let id = kind.to_python_name();
+            let combat_relic = rows(&player["relics"]).iter().find(|r| r["id"] == id);
+            let run_counter = i64::from(run.relic_counters.get(kind).copied().unwrap_or_default());
+            let counter = combat_relic.map_or(run_counter, |row| {
+                row["counter"].as_i64().unwrap_or_default()
+            });
+            let mut relic = json!({"id":id,"name":id});
+            if let Some(v) = snapshot::display_counter(id, counter) {
+                relic["counter"] = json!(v);
+            }
+            for key in ["is_wax", "is_melted"] {
+                if let Some(v) = combat_relic.and_then(|row| row.get(key)) {
+                    relic[key] = v.clone();
+                }
+            }
+            if run.melted_relics.contains(kind) {
+                relic["is_melted"] = json!(true);
+            }
+            relic
+        })
+        .collect::<Vec<_>>();
+    let mut enemies = Vec::new();
+    for (i, uid) in cs.enemy_uids.iter().enumerate() {
+        let e = creature_by_id(&cs.creatures, uid.0)
+            .ok_or_else(|| projection("Missing enemy instance"))?;
+        let id = e
+            .species
+            .ok_or_else(|| projection("Missing enemy species"))?
+            .python_name();
+        let alive = e.current_hp > 0;
+        let intents = if alive {
+            rows(&telegraphs[i])
+                .iter()
+                .map(|intent| {
+                    let mut v = json!({"intent_type":intent["kind"]});
+                    if let Some(damage) = intent.get("effective_amount") {
+                        v["damage"] = damage.clone();
+                        v["hits"] = intent.get("times").cloned().unwrap_or(json!(1));
+                    }
+                    v
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        enemies.push(json!({"id":id,"name":id,"combat_id":uid.0.get(),"hp":e.current_hp.max(0),
+            "max_hp":e.max_hp,"block":e.block,"is_alive":alive,"is_hittable":cs.is_hittable_enemy(*uid),
+            "powers":powers(&wire["encounter"][i]["powers"]),"intents":intents}));
+    }
+    let room = format!(
+        "{:?}",
+        run.current_room
+            .ok_or_else(|| projection("No room"))?
+            .room_type
+    );
+    let act = match run.act_index {
+        1 => format!("{:?}", run.act1),
+        2 => "Hive".to_owned(),
+        _ => "Glory".to_owned(),
+    };
+    let mut available = vec!["END_TURN"];
+    if rows(actions).iter().any(|a| a["action"] == "play") {
+        available.push("PLAY");
+    }
+    if belt.iter().any(|p| p["can_use"] == true) {
+        available.push("POTION");
+    }
+    let mut board = json!({
+        "type":"advice_request","advice_for":"combat_action","request_id":"a1","state_id":1,
+        "game_version":BUILD.as_str(),"mod_version":super::observation::MOD,
+        "player_count":1,"act":run.act_index,"act_name":act,"floor":run.game_floor(),
+        "current_room":room,"room_type":room,"encounter_id":run_wire::combat_encounter_id(rm),
+        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1},
+        "map":map(rm)?,"player":public_player,"enemies":enemies,
+        "run_state":{"character":"IRONCLAD","game_mode":"standard","ascension":rm.ascension_level,
+            "hp":player["hp"],"max_hp":player["max_hp"],"gold":run_wire::gold(rm),"relics":relics,
+            "master_deck":run.master_deck.iter().map(card_model).collect::<Vec<_>>(),
+            "potions":belt,"potion_slot_count":belt.len()},
+        "round":cs.round,"orbs":[],"allies":[],"pets":[],"potions":belt,"available_actions":available,
+    });
+    for (wire_key, board_key, uids) in [
+        ("hand", "hand", cs.player.hand.as_slice()),
+        ("draw_pile", "draw_pile", cs.player.draw.as_slice()),
+        ("discard_pile", "discard_pile", cs.player.discard.as_slice()),
+        ("exhaust_pile", "exhaust_pile", cs.player.exhaust.as_slice()),
+        ("play_pile", "play_pile", cs.player.play.as_slice()),
+    ] {
+        let source = rows(&wire["deck"][wire_key]);
+        if source.len() != uids.len() {
+            return Err(projection("Simulator pile and wire differ"));
+        }
+        let mut cards = Vec::with_capacity(source.len());
+        for (i, (&uid, w)) in uids.iter().zip(source).enumerate() {
+            let c =
+                card_by_uid(&cs.cards, uid).ok_or_else(|| projection("Missing card instance"))?;
+            let mut value = combat_card(&cs, c, w);
+            if wire_key == "hand" {
+                let plays: Vec<_> = rows(actions)
+                    .iter()
+                    .filter(|a| a["action"] == "play" && a["card_index"] == i)
+                    .collect();
+                value["playable"] = json!(!plays.is_empty());
+                value["valid_target_indices"] = json!(
+                    plays
+                        .iter()
+                        .filter_map(|a| a["target_index"].as_u64())
+                        .collect::<Vec<_>>()
+                );
+            }
+            cards.push(value);
+        }
+        if wire_key == "hand" {
+            board[board_key] = json!(cards);
+        } else {
+            board[format!("{board_key}_count")] = json!(cards.len());
+            board[board_key] = json!({"cards":cards,"count":cards.len()});
+        }
+    }
+    board
+        .as_object_mut()
+        .expect("constructed object")
+        .remove("play_pile_count");
+    Ok(board)
+}
