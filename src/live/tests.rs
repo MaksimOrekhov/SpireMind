@@ -294,6 +294,46 @@ fn live_enchantment_display_rules_out_wrong_card_preview_with_same_actions() {
 }
 
 #[test]
+fn live_and_replay_do_not_use_private_relic_latches() {
+    let mut raw = base(Context::Combat);
+    for (id, counter) in [
+        ("PERMAFROST", json!(0)),
+        ("Permafrost", json!(1)),
+        ("RELIC.PERMAFROST", Value::Null),
+    ] {
+        raw["run_state"]["relics"] = json!([{"id":id,"counter":counter}]);
+        assert_eq!(
+            observation::sanitize_live(&raw, Context::Combat)
+                .err()
+                .unwrap()
+                .code,
+            "relic_public_state_missing"
+        );
+        assert_eq!(
+            sanitize(&raw, Context::Combat).err().unwrap().code,
+            "relic_public_state_missing"
+        );
+    }
+
+    let mut reward = base(Context::CardReward);
+    reward["run_state"]["relics"] = json!([
+        {"id":"PERMAFROST","counter":0},
+        {"id":"PEN_NIB","counter":4}
+    ]);
+    let before = observation::sanitize_live(&reward, Context::CardReward).unwrap();
+    reward["run_state"]["relics"][0]["counter"] = json!(1);
+    let after = observation::sanitize_live(&reward, Context::CardReward).unwrap();
+    assert_eq!(before.board, after.board);
+    assert_eq!(after.board["run_state"]["relics"][0]["id"], "PERMAFROST");
+    assert!(
+        after.board["run_state"]["relics"][0]
+            .get("counter")
+            .is_none()
+    );
+    assert_eq!(after.board["run_state"]["relics"][1]["counter"], 4);
+}
+
+#[test]
 fn targeted_potion_requires_current_observed_legal_enemy_indices() {
     let mut raw = base(Context::Combat);
     raw["capabilities"]["spiremind_potion_targets"] = json!(1);

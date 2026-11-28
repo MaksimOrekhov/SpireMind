@@ -293,8 +293,27 @@ fn combat_card(value: &Value, evidence: CardEvidence) -> Result<Value> {
     Ok(c)
 }
 
+fn has_private_relic_latch(id: &str) -> bool {
+    use sts2_core::RelicId;
+
+    let id =
+        sts2_content::names::relic_id_from_str_any_build(id.strip_prefix("RELIC.").unwrap_or(id));
+    matches!(
+        id,
+        Some(
+            RelicId::Vambrace
+                | RelicId::RuinedHelmet
+                | RelicId::Permafrost
+                | RelicId::CentennialPuzzle
+                | RelicId::UnsettlingLamp
+                | RelicId::ThrowingAxe
+                | RelicId::LizardTail
+        )
+    )
+}
+
 pub(super) fn relic(value: &Value) -> Result<Value> {
-    let r = object(
+    let mut r = object(
         value,
         "id name counter stack_count is_wax is_melted status",
         "description rarity",
@@ -312,7 +331,15 @@ pub(super) fn relic(value: &Value) -> Result<Value> {
             "Relic needs additional observation or mapping",
         ));
     }
-    ints(&r, "counter", -1000..=1000)?;
+    // The pinned producer overloads counter with these private spent bits
+    // even when ShowCounter is false. Keep them out of run features and diagnostics.
+    if has_private_relic_latch(id) {
+        r.as_object_mut()
+            .expect("validated relic")
+            .remove("counter");
+    } else {
+        ints(&r, "counter", -1000..=1000)?;
+    }
     ints(&r, "stack_count", 0..=1000)?;
     Ok(r)
 }
@@ -683,6 +710,15 @@ fn project(
             string(&b, "encounter_id")?;
             if number(&b, "round", 1000)? == 0 {
                 return Err(schema("combat round"));
+            }
+            if list(&b["run_state"], "relics", 128)?
+                .iter()
+                .any(|r| r["id"].as_str().is_some_and(has_private_relic_latch))
+            {
+                return Err(Failure::new(
+                    "relic_public_state_missing",
+                    "A combat relic has no verified public spent-state carrier",
+                ));
             }
             for k in ["orbs", "pets", "allies"] {
                 if !list(&b, k, 16)?.is_empty() {
