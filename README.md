@@ -1,6 +1,6 @@
 # SpireMind
 
-SpireMind — локальный советник для одиночных забегов Slay the Spire 2. PoC SM-01 запускает опубликованную модель Instinct на CPU и ранжирует действия Ironclad A10 в симуляторе Spire Mentor для игры `v0.111.0`. CLI поддерживает боевой ход, выбор карточной награды и следующий узел карты. Подключение к запущенной игре относится к следующему этапу.
+SpireMind — локальный советник для одиночных забегов Slay the Spire 2. SM-01 запускает опубликованную модель Instinct на CPU и ранжирует действия Ironclad A10 в симуляторе Spire Mentor для игры `v0.111.0`. SM-02 добавляет подключение к запущенной игре через Advisor Mode. Оба режима используют одни и те же веса и поддерживают боевой ход, карточную награду и выбор следующего узла карты.
 
 ## Установка и запуск
 
@@ -34,3 +34,43 @@ cargo run --release --locked -- recommend map --seed 160000000
 Для тестов без весов запустите `python scripts/setup.py --source-only`, затем `cargo test --release --locked`. Реальный smoke запускается отдельно: `cargo test --release --locked model_smoke -- --ignored --nocapture`. См. [фактические результаты и команды](docs/research/poc-results.md).
 
 [Архитектура](docs/architecture.md) · [ADR интеграции](docs/adr/0001-engine-integration.md) · [Исследование upstream](docs/research/upstream.md) · [Дорожная карта](docs/roadmap.md) · [Уведомление MIT](THIRD_PARTY_NOTICES.md)
+
+## SM-02. Советник для запущенной игры
+
+Live-клиент читает `advice_request` мода **Spire Mentor 0.11.10** с закреплённым расширением наблюдателя SpireMind. Заявленная граница — одиночный стандартный Ironclad A0 или A10, игра `v0.111.0` (`41cef1ea`) или `v0.111.1` (`cc1f9462`), модель SM-01. Фактический статус каждой поверхности записан в [отчёте SM-02](docs/research/live-results.md).
+
+Экспериментальная сборка наблюдателя `--native-current` включает боевой прототип C. Ей соответствует флаг `live --native-current`. Установка этой DLL согласуется отдельно. [Контракт, сборка и сценарий проверки](docs/research/native-current-prototype.md)
+
+1. Установите BaseLib 3.4.7 и сборку Spire Mentor 0.11.10 с [расширением жизненного цикла](docs/research/live-results.md#сборка-расширения-наблюдателя). Запустите игру с модами. В **Mod Configuration → Spire Mentor** выключите **Auto-launch Python advisor** и включите режим **Coach** или **Hints**. Оставьте Auto Play и Auto Battle выключенными.
+2. Из корня SpireMind выполните `python scripts/setup.py`, затем `python scripts/setup.py --check-source`. Соберите `cargo build --release --locked` в **x64 Native Tools Command Prompt for VS 2022**. Обновлённый MSVC нужен для транзитивного кода upstream. При запуске уже собранного CLI компилятор и Python не используются.
+3. Запустите советник в отдельном терминале. Обязательный `--release-info` указывает на `release_info.json` установленной игры. Клиент проверяет точную пару версии и коммита до подключения.
+
+```powershell
+$release = 'D:\SteamLibrary\steamapps\common\Slay the Spire 2\release_info.json'
+.\target\release\spiremind.exe live --release-info $release
+```
+
+Вручную начните или продолжите стандартный одиночный забег Ironclad. В терминале позиция и индексы относятся к текущему снимку. Ранжирование выражает вероятность выбора класса действия. Статус `forced` означает ровно одно легальное действие без оценки модели. `blocked` сообщает причину отказа. `stale` аннулирует предыдущий совет. Пока мод подтверждает ту же позицию, совет остаётся видимым. Через 1,5 с без позиционного подтверждения клиент очищает совет и переподключается для получения нового снимка. Отдельное окно Spire Mentor `Hints` показывает состояние собственного интерфейса мода. В бою при переподключении клиент использует видимый граф карты из свежего снимка, если подтверждены текущий узел и история посещений.
+
+Для проверки сохраните санитизированные снимки и результаты в игнорируемом каталоге. `--json` выводит события в JSON Lines с явной инвалидацией и подтверждениями `confirmed`. `receive_to_result_ms` отсчитывается от приёма полного кадра до публикации результата после первого подтверждения. Мод не присылает сопоставимую метку времени захвата экрана.
+
+```powershell
+New-Item -ItemType Directory -Force .local/live-captures | Out-Null
+.\target\release\spiremind.exe live --release-info $release --json --capture-dir .local/live-captures |
+  Tee-Object -FilePath .local/live-captures/events.jsonl
+$snapshots = @(Get-ChildItem .local/live-captures -Filter 'advisor-*.json' | Select-Object -ExpandProperty FullName)
+.\target\release\spiremind.exe replay @snapshots
+python scripts/live_metrics.py .local/live-captures/events.jsonl --captures .local/live-captures
+```
+
+В профиле по умолчанию live требует `spiremind_power_visibility=1` и булев `observer_visible` для каждого боевого эффекта. `replay` продолжает открывать старые санитизированные снимки и распознаёт версию боевых кадров C.
+
+Для разбора блокировок добавьте к запуску `live` параметр `--blocked-corpus .local/blocked-a0`. Укажите новый каталог. Команда `python scripts/coverage_panel.py blockers .local/blocked-a0` ранжирует санитизированные причины отказов. ID эффекта указан, если игра подтвердила его видимость и он найден в закреплённом реестре. `spiremind compatibility` запускает отдельный офлайн-набор с исходным движком и весами Instinct. [Таблица эффектов и результаты](docs/research/combat-compatibility.md)
+
+`spiremind held-out` проверяет позиции из независимых кампаний, которые проходит Instinct. Для боёв с Glam, Vigorous, Swift, Sown и зельями с выбором противника сборка наблюдателя передаёт дополнительные признаки из игрового интерфейса. [Аудит проектора и методика проверки](docs/research/combat-projection-audit.md)
+
+Для реликвий с состоянием срабатывания обновлённый наблюдатель передаёт видимый статус иконки или подтверждение из журнала текущего боя. Архивная выборка на 2 269 позиций используется для регрессии, новая проверочная выборка задаётся через `held-out --first-seed`. [Аудит реликвий и результаты](docs/research/relic-observation-audit.md)
+
+`spiremind architecture` сравнивает строгий адаптер, нативный Advisor и эксперимент с текущими параметрами боя без фактических будущих исходов. Команда работает на симуляторных панелях. [Сравнение архитектур](docs/research/advisor-architecture-experiment.md)
+
+Остановите CLI через `Ctrl+C`. Чтобы отключить мод, переведите его в режим **Off** или выключите в меню модов. Для отката ручной установки закройте игру и вынесите папку `mods/SpireMentor` из каталога игры. `mods/BaseLib` оставьте, если она нужна другим модам. Для Workshop-установки отпишитесь от Spire Mentor. [ADR live bridge](docs/adr/0002-live-bridge.md)

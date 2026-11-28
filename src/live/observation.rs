@@ -1,0 +1,919 @@
+use std::collections::BTreeSet;
+
+use serde_json::{Map, Value, json};
+
+use super::{
+    powers::{self, Owner},
+    relics,
+};
+use crate::{Failure, Result, contract::Context};
+
+pub const MOD: &str = "0.11.10";
+
+// The pinned engine documents this exact stable release (cc1f9462) as
+// decompiling identically to 41cef1ea. This is an explicit pair, not hotfix matching.
+pub fn live_build(version: &str) -> Result<()> {
+    match version {
+        "v0.111.0" | "v0.111.1" => Ok(()),
+        _ => Err(Failure::new(
+            "incompatible_game_version",
+            "Live bridge expects v0.111.0 or the documented stable v0.111.1 equivalent",
+        )),
+    }
+}
+
+pub struct Observation {
+    pub context: Context,
+    pub board: Value,
+}
+
+pub fn schema(field: &str) -> Failure {
+    Failure::new(
+        "schema_mismatch",
+        format!("Missing or unsupported {field} in the pinned observation schema"),
+    )
+}
+
+pub fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {
+    value[key]
+        .as_str()
+        .filter(|s| !s.is_empty() && s.len() <= 256)
+        .ok_or_else(|| schema(key))
+}
+
+pub fn number(value: &Value, key: &str, max: u64) -> Result<u64> {
+    value[key]
+        .as_u64()
+        .filter(|n| *n <= max)
+        .ok_or_else(|| schema(key))
+}
+
+pub fn boolean(value: &Value, key: &str) -> Result<bool> {
+    value[key].as_bool().ok_or_else(|| schema(key))
+}
+
+pub fn list<'a>(value: &'a Value, key: &str, max: usize) -> Result<&'a [Value]> {
+    value[key]
+        .as_array()
+        .filter(|a| a.len() <= max)
+        .map(Vec::as_slice)
+        .ok_or_else(|| schema(key))
+}
+
+fn object(value: &Value, fields: &str, ignored: &str, label: &str) -> Result<Value> {
+    let input = value.as_object().ok_or_else(|| schema(label))?;
+    let mut out = Map::new();
+    for (key, value) in input {
+        if fields.split_ascii_whitespace().any(|k| k == key) {
+            out.insert(key.clone(), value.clone());
+        } else if !ignored.split_ascii_whitespace().any(|k| k == key) {
+            let field =
+                if key.len() <= 60 && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                    key.as_str()
+                } else {
+                    "<invalid key>"
+                };
+            return Err(Failure::new(
+                "unknown_field",
+                format!("Unsupported field {label}.{field}"),
+            ));
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+fn map_list(values: &[Value], f: impl Fn(&Value) -> Result<Value>) -> Result<Value> {
+    Ok(Value::Array(
+        values.iter().map(f).collect::<Result<Vec<_>>>()?,
+    ))
+}
+
+fn ints(value: &Value, key: &str, range: std::ops::RangeInclusive<i64>) -> Result<()> {
+    if value[key].is_null() || value[key].as_i64().is_some_and(|n| range.contains(&n)) {
+        Ok(())
+    } else {
+        Err(schema(key))
+    }
+}
+
+fn primitive_fields(value: &Value, names: &[&str], accepts: fn(&Value) -> bool) -> Result<()> {
+    for &key in names {
+        if !value[key].is_null() && !accepts(&value[key]) {
+            return Err(schema(key));
+        }
+    }
+    Ok(())
+}
+
+fn short_text(value: &Value) -> bool {
+    value.as_str().is_some_and(|s| s.len() <= 256)
+}
+
+fn integer_array(value: &Value, size: usize, maximum: u64) -> bool {
+    value.as_array().is_some_and(|values| {
+        values.len() <= size
+            && values
+                .iter()
+                .all(|v| v.as_u64().is_some_and(|n| n <= maximum))
+    })
+}
+
+fn stat_map(value: &Value, label: &str) -> Result<()> {
+    if value.is_null()
+        || value.as_object().is_some_and(|m| {
+            m.len() <= 32
+                && m.iter().all(|(k, v)| {
+                    k.len() <= 48
+                        && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                        && v.as_i64()
+                            .is_some_and(|n| (-100_000..=100_000).contains(&n))
+                })
+        })
+    {
+        Ok(())
+    } else {
+        Err(schema(label))
+    }
+}
+
+pub(super) fn card(value: &Value) -> Result<Value> {
+    let mut c = object(
+        value,
+        "id name index upgrade_level upgraded cost base_cost persistent_cost played_cost stable_cost effective_cost costs_x type target_type exhaust innate retain ethereal will_exhaust will_retain sly sly_this_turn stats affliction affliction_stacks enchantment enchantment_amount observer_enchantment_status playable unplayable_reason valid_target_indices base_replay_count star_cost persistent_star_cost combat_vars",
+        "description rarity is_upgradable is_removable is_curse is_status pile forecast stable_idx uid uid_hint position",
+        "card",
+    )?;
+    string(&c, "id")?;
+    string(&c, "name")?;
+    number(&c, "upgrade_level", 1)?;
+    stat_map(&c["stats"], "card stats")?;
+    if let Some(stats) = c.get_mut("stats").and_then(Value::as_object_mut) {
+        stats.retain(|key, _| matches!(key.as_str(), "damage" | "block"));
+    }
+    primitive_fields(
+        &c,
+        &[
+            "type",
+            "target_type",
+            "affliction",
+            "enchantment",
+            "unplayable_reason",
+        ],
+        short_text,
+    )?;
+    primitive_fields(
+        &c,
+        &[
+            "upgraded",
+            "costs_x",
+            "exhaust",
+            "innate",
+            "retain",
+            "ethereal",
+            "will_exhaust",
+            "will_retain",
+            "sly",
+            "sly_this_turn",
+            "playable",
+        ],
+        Value::is_boolean,
+    )?;
+    if !c["valid_target_indices"].is_null() && !integer_array(&c["valid_target_indices"], 32, 31) {
+        return Err(schema("valid_target_indices"));
+    }
+    for k in [
+        "cost",
+        "base_cost",
+        "persistent_cost",
+        "played_cost",
+        "stable_cost",
+        "effective_cost",
+        "star_cost",
+        "persistent_star_cost",
+        "affliction_stacks",
+        "enchantment_amount",
+        "base_replay_count",
+        "index",
+    ] {
+        ints(&c, k, -1..=1000)?;
+    }
+    if !c["combat_vars"].is_null()
+        && !(matches!(c["id"].as_str(), Some("BOLAS" | "THRUMMING_HATCHET"))
+            && c["combat_vars"]
+                .as_object()
+                .is_some_and(|vars| vars.len() == 1)
+            && number(&c["combat_vars"], "return_if_played_round", 1000)
+                .is_ok_and(|round| round > 0))
+    {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "Card exposes unsupported per-instance combat state",
+        ));
+    }
+    if !c["observer_enchantment_status"].is_null()
+        && !matches!(
+            c["observer_enchantment_status"].as_str(),
+            Some("Normal" | "Disabled")
+        )
+    {
+        return Err(schema("observer_enchantment_status"));
+    }
+    Ok(c)
+}
+
+#[derive(Clone, Copy)]
+struct CardEvidence {
+    round: u64,
+    extra_turns: Option<u64>,
+    pristine: bool,
+    status_from_producer: bool,
+}
+
+fn combat_card(value: &Value, evidence: CardEvidence) -> Result<Value> {
+    use sts2_core::cards::EnchantmentId;
+    let mut c = card(value)?;
+    let returns_on_draw = matches!(string(&c, "id")?, "BOLAS" | "THRUMMING_HATCHET");
+    let enchantment = c["enchantment"]
+        .as_str()
+        .and_then(|name| EnchantmentId::from_wire_name(name.split(" / ").next().unwrap_or(name)));
+    // The producer describes the enchantment but does not serialize the
+    // per-copy consumed bit. A legal attack can still get the wrong preview.
+    let reported = !c["observer_enchantment_status"].is_null();
+    if reported && !evidence.status_from_producer {
+        return Err(Failure::new(
+            "card_public_state_missing",
+            "Enchantment status requires the observer capability",
+        ));
+    }
+    let mapped = enchantment
+        .and_then(super::engine::enchantment_used_var)
+        .is_some();
+    if reported && !mapped {
+        // The producer's rendering status has no audited state mapping for
+        // other enchantments. Keep it outside the admitted projection.
+        c.as_object_mut()
+            .expect("validated card")
+            .remove("observer_enchantment_status");
+    }
+    if !evidence.pristine
+        && !(mapped && reported)
+        && matches!(
+            enchantment,
+            Some(
+                EnchantmentId::Vigorous
+                    | EnchantmentId::Glam
+                    | EnchantmentId::Sown
+                    | EnchantmentId::Swift
+            )
+        )
+    {
+        return Err(Failure::new(
+            "card_public_state_missing",
+            "Enchantment use per card instance is not observed",
+        ));
+    }
+    if enchantment == Some(EnchantmentId::Goopy)
+        && !number(&c, "enchantment_amount", 1000).is_ok_and(|amount| amount > 0)
+    {
+        return Err(Failure::new(
+            "card_public_state_missing",
+            "Goopy needs its current visible stack",
+        ));
+    }
+    if returns_on_draw
+        && (evidence.extra_turns != Some(0)
+            || c["combat_vars"]["return_if_played_round"]
+                .as_u64()
+                .is_some_and(|turn| {
+                    !(evidence.round.saturating_sub(1)..=evidence.round).contains(&turn)
+                }))
+    {
+        return Err(Failure::new(
+            "card_public_state_missing",
+            "Card return history cannot be attributed to this player turn",
+        ));
+    }
+    Ok(c)
+}
+
+pub(super) fn relic(value: &Value) -> Result<Value> {
+    let mut r = object(
+        value,
+        "id name counter stack_count is_wax is_melted status observer_relic_status observer_trigger_seen",
+        "description rarity",
+        "relic",
+    )?;
+    let id = string(&r, "id")?;
+    primitive_fields(&r, &["name", "status"], short_text)?;
+    primitive_fields(&r, &["is_wax", "is_melted"], Value::is_boolean)?;
+    if matches!(id, "TOY_BOX" | "POCKETWATCH" | "GOLDEN_COMPASS")
+        || r["is_wax"] == true
+        || r["is_melted"] == true
+    {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "Relic needs additional observation or mapping",
+        ));
+    }
+    // The pinned producer overloads counter with these private spent bits
+    // even when ShowCounter is false. Keep them out of run features and diagnostics.
+    if relics::id(&r).is_some_and(relics::has_private_latch) {
+        r.as_object_mut()
+            .expect("validated relic")
+            .remove("counter");
+    } else {
+        ints(&r, "counter", -1000..=1000)?;
+    }
+    if !r["observer_relic_status"].is_null()
+        && !matches!(
+            r["observer_relic_status"].as_str(),
+            Some("normal" | "active" | "disabled")
+        )
+    {
+        return Err(schema("relic observer status"));
+    }
+    primitive_fields(&r, &["observer_trigger_seen"], Value::is_boolean)?;
+    ints(&r, "stack_count", 0..=1000)?;
+    Ok(r)
+}
+
+pub(super) fn potion(value: &Value) -> Result<Value> {
+    let p = object(
+        value,
+        "slot empty id name usage can_use target_type requires_target valid_target_indices",
+        "description rarity",
+        "potion",
+    )?;
+    number(&p, "slot", 15)?;
+    primitive_fields(&p, &["id", "name", "usage", "target_type"], short_text)?;
+    primitive_fields(&p, &["can_use", "requires_target"], Value::is_boolean)?;
+    if !p["valid_target_indices"].is_null()
+        && (!integer_array(&p["valid_target_indices"], 32, 31) || p["target_type"] != "AnyEnemy")
+    {
+        return Err(schema("potion valid_target_indices"));
+    }
+    if !boolean(&p, "empty")? {
+        string(&p, "id")?;
+        string(&p, "name")?;
+        string(&p, "usage")?;
+        string(&p, "target_type")?;
+        boolean(&p, "can_use")?;
+        boolean(&p, "requires_target")?;
+    }
+    Ok(p)
+}
+
+pub(super) fn power(value: &Value, owner: Owner) -> Result<Value> {
+    if let Some(visibility) = value.get("observer_visible") {
+        if visibility == false {
+            return Err(Failure::new(
+                "unsupported_mechanic",
+                "Power visibility was not confirmed",
+            ));
+        }
+        if visibility != true {
+            return Err(schema("power visibility"));
+        }
+    }
+    let p = object(
+        value,
+        "id name amount display_amount observer_self_damage",
+        "description type stack_type target applier player_target vars instance_id observer_visible",
+        "power",
+    )?;
+    string(&p, "id")?;
+    string(&p, "name")?;
+    if !p["amount"]
+        .as_i64()
+        .is_some_and(|n| (-10_000..=10_000).contains(&n))
+    {
+        return Err(schema("power amount"));
+    }
+    ints(&p, "display_amount", -10_000..=10_000)?;
+    ints(&p, "observer_self_damage", 0..=1000)?;
+    if !p["observer_self_damage"].is_null()
+        && !(owner == Owner::Player
+            && p["id"].as_str().and_then(powers::registry_id)
+                == Some(sts2_core::PowerKind::CrimsonMantle))
+    {
+        return Err(schema("power tooltip witness"));
+    }
+    // Never pass raw counters or dynamic vars through to the importer.
+    powers::validate(&p, owner)?;
+    Ok(p)
+}
+
+pub(super) fn live_power(value: &Value, owner: Owner) -> Result<Value> {
+    if !value["observer_visible"].is_boolean() {
+        return Err(Failure::new(
+            "power_visibility_unverified",
+            "Live effects require a boolean observer_visible marker",
+        ));
+    }
+    power(value, owner)
+}
+
+pub(super) fn intent(value: &Value) -> Result<Value> {
+    let i = object(
+        value,
+        "kind intent_type damage hits total_damage",
+        "title description next_move_id forecast",
+        "intent",
+    )?;
+    let kind = string(&i, "intent_type")?;
+    primitive_fields(&i, &["kind"], short_text)?;
+    ints(&i, "damage", 0..=100_000)?;
+    ints(&i, "hits", 1..=100)?;
+    ints(&i, "total_damage", 0..=10_000_000)?;
+    if kind.eq_ignore_ascii_case("attack") || kind.eq_ignore_ascii_case("deathblow") {
+        number(&i, "damage", 100_000)?;
+        number(&i, "hits", 100)?;
+    }
+    Ok(i)
+}
+
+pub(super) fn monster_kind(value: &Value) -> Option<sts2_core::MonsterKind> {
+    value["id"]
+        .as_str()
+        .and_then(sts2_wire::state_dict::monster_kind_from_python_name)
+}
+
+pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
+    let e = object(
+        value,
+        "id name combat_id hp max_hp block is_alive is_hittable slot slot_name powers intents",
+        "side is_player is_monster next_move_id move_state move_history ai forecast fabricator_last_spawned curse_of_knowledge_counter",
+        "enemy",
+    )?;
+    string(&e, "id")?;
+    let kind = monster_kind(&e);
+    if kind == Some(sts2_core::MonsterKind::ThievingHopper) {
+        return Err(Failure::new(
+            "card_public_state_missing",
+            "The thief needs card deck provenance that the producer does not identify",
+        ));
+    }
+    if matches!(
+        kind,
+        Some(sts2_core::MonsterKind::Fabricator | sts2_core::MonsterKind::KnowledgeDemon)
+    ) {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "Encounter needs private counters",
+        ));
+    }
+    string(&e, "name")?;
+    number(&e, "hp", 100_000)?;
+    number(&e, "max_hp", 100_000)?;
+    number(&e, "block", 100_000)?;
+    ints(&e, "combat_id", 0..=i64::from(u32::MAX))?;
+    ints(&e, "slot", 0..=64)?;
+    primitive_fields(&e, &["slot_name"], short_text)?;
+    boolean(&e, "is_alive")?;
+    boolean(&e, "is_hittable")?;
+    if e["is_alive"] == true && e["is_hittable"] != true {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "A living enemy is temporarily untargetable",
+        ));
+    }
+    Ok(e)
+}
+
+fn enemy(value: &Value, validate_power: fn(&Value, Owner) -> Result<Value>) -> Result<Value> {
+    let mut e = enemy_envelope(value)?;
+    e["powers"] = map_list(list(&e, "powers", 64)?, |p| validate_power(p, Owner::Enemy))?;
+    if monster_kind(&e) != Some(sts2_core::MonsterKind::BowlbugRock)
+        && list(&e, "powers", 64)?.iter().any(|p| {
+            p["id"].as_str().and_then(powers::registry_id) == Some(sts2_core::PowerKind::Imbalanced)
+        })
+    {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "Imbalanced needs the observed Bowlbug Rock telegraph",
+        ));
+    }
+    if e["is_alive"] == false
+        && list(&e, "powers", 64)?.iter().any(|p| {
+            p["id"].as_str().and_then(powers::registry_id) == Some(sts2_core::PowerKind::Illusion)
+        })
+        && !e["intents"]
+            .as_array()
+            .is_some_and(|intents| intents.len() == 1 && intents[0]["intent_type"] == "Heal")
+    {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "A fallen Illusion lacks its visible revive intent",
+        ));
+    }
+    e["intents"] = map_list(list(&e, "intents", 8)?, intent)?;
+    Ok(e)
+}
+
+fn coord(value: &Value) -> Result<Value> {
+    let p = object(value, "col row", "", "map coordinate")?;
+    number(&p, "col", 15)?;
+    number(&p, "row", 40)?;
+    Ok(p)
+}
+
+fn node(value: &Value, graph: bool) -> Result<Value> {
+    let mut n = object(
+        value,
+        if graph {
+            "col row type children"
+        } else {
+            "col row type index"
+        },
+        "",
+        "map node",
+    )?;
+    number(&n, "col", 15)?;
+    number(&n, "row", 40)?;
+    let kind = string(&n, "type")?;
+    if !matches!(
+        kind,
+        "Unknown" | "Monster" | "Elite" | "Boss" | "Shop" | "RestSite" | "Treasure" | "Ancient"
+    ) {
+        return Err(schema("map node type"));
+    }
+    if graph {
+        n["children"] = map_list(list(&n, "children", 16)?, coord)?;
+    } else {
+        number(&n, "index", 255)?;
+    }
+    Ok(n)
+}
+
+pub fn point(v: &Value) -> Result<(u64, u64)> {
+    Ok((number(v, "col", 15)?, number(v, "row", 40)?))
+}
+
+pub(super) fn map(value: &Value) -> Result<Value> {
+    let mut m = object(
+        value,
+        "row_count col_count current boss second_boss visited nodes",
+        "encounter_queue event_queue",
+        "act map",
+    )?;
+    number(&m, "row_count", 41)?;
+    number(&m, "col_count", 16)?;
+    if m.get("current").is_none() {
+        return Err(schema("map current"));
+    }
+    if !m["current"].is_null() {
+        m["current"] = coord(&m["current"])?;
+    }
+    for name in ["boss", "second_boss"] {
+        if name == "second_boss" && m[name].is_null() {
+            continue;
+        }
+        let b = object(&m[name], "col row id", "", "boss node")?;
+        point(&b)?;
+        if name == "boss" || !b["id"].is_null() {
+            string(&b, "id")?;
+        }
+        m[name] = b;
+    }
+    m["visited"] = map_list(list(&m, "visited", 64)?, coord)?;
+    m["nodes"] = map_list(list(&m, "nodes", 256)?, |n| node(n, true))?;
+    let graph = list(&m, "nodes", 256)?;
+    let coords = graph.iter().map(point).collect::<Result<BTreeSet<_>>>()?;
+    if coords.len() != graph.len() || coords.is_empty() {
+        return Err(schema("unique map nodes"));
+    }
+    let boss = point(&m["boss"])?;
+    for n in graph {
+        let (_, row) = point(n)?;
+        for child in list(n, "children", 16)? {
+            let p = point(child)?;
+            if p.1 <= row || (!coords.contains(&p) && p != boss) {
+                return Err(schema("map edge"));
+            }
+        }
+    }
+    Ok(m)
+}
+
+fn run_state(value: &Value) -> Result<Value> {
+    let mut run = object(
+        value,
+        "gold hp max_hp potions potion_slot_count relics master_deck ascension game_mode character is_last_act awaiting_second_boss",
+        "unlocked_epochs dominion seed rng encounter_queue event_queue",
+        "run_state",
+    )?;
+    if string(&run, "game_mode")? != "standard" || string(&run, "character")? != "IRONCLAD" {
+        return Err(Failure::new(
+            "unsupported_run",
+            "Only solo standard Ironclad is supported",
+        ));
+    }
+    if !matches!(number(&run, "ascension", 10)?, 0 | 10) {
+        return Err(Failure::new(
+            "unsupported_ascension",
+            "Only A0 and A10 are admitted by this bridge",
+        ));
+    }
+    number(&run, "gold", 100_000)?;
+    number(&run, "hp", 100_000)?;
+    number(&run, "max_hp", 100_000)?;
+    let slots = number(&run, "potion_slot_count", 16)?;
+    primitive_fields(
+        &run,
+        &["is_last_act", "awaiting_second_boss"],
+        Value::is_boolean,
+    )?;
+    run["master_deck"] = map_list(list(&run, "master_deck", 128)?, card)?;
+    run["relics"] = map_list(list(&run, "relics", 128)?, relic)?;
+    run["potions"] = map_list(list(&run, "potions", 16)?, potion)?;
+    if slots != list(&run, "potions", 16)?.len() as u64
+        || run["master_deck"].as_array().is_none_or(Vec::is_empty)
+        || run["max_hp"] == 0
+    {
+        return Err(schema("run deck, HP or potion slots"));
+    }
+    Ok(run)
+}
+
+pub fn context(value: &Value) -> Result<Context> {
+    match string(value, "advice_for")? {
+        "combat_action" => Ok(Context::Combat),
+        "card_reward" => Ok(Context::CardReward),
+        "map_select" => Ok(Context::Map),
+        _ => Err(Failure::new(
+            "unsupported_state",
+            "This screen is outside SM-02",
+        )),
+    }
+}
+
+pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
+    project(raw, context, power, true)
+}
+
+pub(super) fn sanitize_live(raw: &Value, context: Context) -> Result<Observation> {
+    confirm_power_capability(raw)?;
+    if raw["capabilities"]["spiremind_relic_witness"] != 1
+        && raw["run_state"]["relics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| !r["observer_relic_status"].is_null() || !r["observer_trigger_seen"].is_null())
+    {
+        return Err(schema("relic witness capability"));
+    }
+    if raw["capabilities"]["spiremind_power_tooltip"] != 1
+        && raw["player"]["powers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| !p["observer_self_damage"].is_null())
+    {
+        return Err(schema("power tooltip capability"));
+    }
+    if context == Context::Combat
+        && raw["capabilities"]["spiremind_potion_targets"] != 1
+        && [&raw["potions"], &raw["run_state"]["potions"]]
+            .into_iter()
+            .flat_map(|belt| belt.as_array().into_iter().flatten())
+            .any(|p| !p["valid_target_indices"].is_null())
+    {
+        return Err(Failure::new(
+            "potion_targets_unverified",
+            "Targeted potion evidence requires the observer capability",
+        ));
+    }
+    project(
+        raw,
+        context,
+        live_power,
+        raw["capabilities"]["spiremind_card_status"] == 1,
+    )
+}
+
+pub(super) fn confirm_power_capability(raw: &Value) -> Result<()> {
+    if raw["capabilities"]["spiremind_power_visibility"] != 1 {
+        return Err(Failure::new(
+            "power_visibility_not_supported",
+            "Install the pinned SpireMind observer with power visibility before using live",
+        ));
+    }
+    Ok(())
+}
+
+fn project(
+    raw: &Value,
+    context: Context,
+    validate_power: fn(&Value, Owner) -> Result<Value>,
+    card_status_from_producer: bool,
+) -> Result<Observation> {
+    if context == Context::CardReward && (!raw["surface"].is_null() || !raw["combat"].is_null()) {
+        return Err(Failure::new(
+            "unsupported_state",
+            "Only the normal card reward screen is supported",
+        ));
+    }
+    let mut b = object(
+        raw,
+        "type advice_for state_id request_id game_version mod_version player_count act act_name floor current_room run_state map surface nodes cards can_skip player hand draw_pile discard_pile exhaust_pile play_pile draw_pile_count discard_pile_count exhaust_pile_count enemies potions available_actions round room_type encounter_id allies orbs orb_capacity pets combat turn",
+        "seed seedless seedless_seed rng coop_rng combat_log capabilities brain language forecast encounter_queue event_queue",
+        "advice_request",
+    )?;
+    if b["type"] != "advice_request" || b["mod_version"] != MOD {
+        return Err(schema("advisor type or mod_version"));
+    }
+    live_build(string(&b, "game_version")?)?;
+    primitive_fields(&b, &["request_id", "current_room"], short_text)?;
+    if b["player_count"] != 1 {
+        return Err(Failure::new(
+            "unsupported_run",
+            "Only one player is supported",
+        ));
+    }
+    if number(&b, "act", 3)? == 0 || number(&b, "state_id", i64::MAX as u64)? == 0 {
+        return Err(schema("act or state_id"));
+    }
+    number(&b, "floor", 100)?;
+    string(&b, "act_name")?;
+    b["run_state"] = run_state(&b["run_state"])?;
+    if !b["map"].is_null() {
+        b["map"] = map(&b["map"])?;
+    }
+    match context {
+        Context::Combat => {
+            if !matches!(string(&b, "room_type")?, "Monster" | "Elite" | "Boss")
+                || !b["combat"].is_null()
+            {
+                return Err(schema("combat surface"));
+            }
+            string(&b, "encounter_id")?;
+            if number(&b, "round", 1000)? == 0 {
+                return Err(schema("combat round"));
+            }
+            for relic in list(&b["run_state"], "relics", 128)? {
+                relics::combat_counter(relic)?;
+            }
+            for k in ["orbs", "pets", "allies"] {
+                if !list(&b, k, 16)?.is_empty() {
+                    return Err(Failure::new(
+                        "unsupported_mechanic",
+                        "Orbs, pets or allies require a wider observation adapter",
+                    ));
+                }
+            }
+            let player_fields = "hp max_hp block energy max_energy powers cards_played_this_turn bound_card_played_this_turn hp_lost_this_turn unblocked_hits_this_combat powered_hits_this_turn cards_exhausted_this_combat cards_exhausted_this_turn card_block_gains_this_turn discards_this_turn cards_drawn_this_combat cards_generated_this_combat extra_turns_taken_this_combat";
+            let mut p = object(
+                &b["player"],
+                player_fields,
+                "net_id seat_index stars",
+                "combat player",
+            )?;
+            for k in ["hp", "max_hp", "block", "energy", "max_energy"] {
+                number(&p, k, 100_000)?;
+            }
+            ints(&b, "orb_capacity", 0..=16)?;
+            ints(&b, "turn", 0..=1000)?;
+            let played = &p["cards_played_this_turn"];
+            if !played.as_array().is_some_and(|values| values.len() == 5)
+                || !integer_array(played, 5, 1000)
+            {
+                return Err(schema("cards_played_this_turn"));
+            }
+            primitive_fields(
+                &p,
+                &["bound_card_played_this_turn", "hp_lost_this_turn"],
+                Value::is_boolean,
+            )?;
+            for name in [
+                "unblocked_hits_this_combat",
+                "cards_exhausted_this_combat",
+                "cards_exhausted_this_turn",
+                "card_block_gains_this_turn",
+                "discards_this_turn",
+                "cards_drawn_this_combat",
+                "cards_generated_this_combat",
+                "extra_turns_taken_this_combat",
+            ] {
+                ints(&p, name, 0..=100_000)?;
+            }
+            p["powers"] = map_list(list(&p, "powers", 64)?, |p| {
+                validate_power(p, Owner::Player)
+            })?;
+            if p.get("powered_hits_this_turn").is_some() {
+                p["powered_hits_this_turn"] =
+                    map_list(list(&p, "powered_hits_this_turn", 32)?, |hit| {
+                        let clean = object(hit, "enemy hits", "", "powered hits")?;
+                        number(&clean, "enemy", 32)?;
+                        number(&clean, "hits", 100_000)?;
+                        Ok(clean)
+                    })?;
+            }
+            let round = number(&b, "round", 1000)?;
+            let extra_turns = p["extra_turns_taken_this_combat"].as_u64();
+            let pristine = round == 1
+                && p["extra_turns_taken_this_combat"] == 0
+                && p["cards_played_this_turn"]
+                    .as_array()
+                    .is_some_and(|buckets| buckets.iter().all(|n| n == 0));
+            let evidence = CardEvidence {
+                round,
+                extra_turns,
+                pristine,
+                status_from_producer: card_status_from_producer,
+            };
+            if list(&p, "powers", 64)?.iter().any(|v| {
+                v["id"].as_str().and_then(powers::registry_id)
+                    == Some(sts2_core::PowerKind::Unmovable)
+            }) && p["card_block_gains_this_turn"].as_u64().is_none()
+            {
+                return Err(Failure::new(
+                    "power_public_history",
+                    "Unmovable needs this turn's observed card block gains",
+                ));
+            }
+            b["player"] = p;
+            b["hand"] = map_list(list(&b, "hand", 32)?, |raw| {
+                let c = combat_card(raw, evidence)?;
+                number(&c, "effective_cost", 1000)?;
+                boolean(&c, "playable")?;
+                string(&c, "target_type")?;
+                list(&c, "valid_target_indices", 32)?;
+                Ok(c)
+            })?;
+            for (pile, count) in [
+                ("draw_pile", Some("draw_pile_count")),
+                ("discard_pile", Some("discard_pile_count")),
+                ("exhaust_pile", Some("exhaust_pile_count")),
+                ("play_pile", None),
+            ] {
+                let raw = object(
+                    &b[pile],
+                    "cards count",
+                    "type known_top known_bottom rng order",
+                    "combat pile",
+                )?;
+                let mut cards = list(&raw, "cards", 128)?
+                    .iter()
+                    .map(|c| combat_card(c, evidence))
+                    .collect::<Result<Vec<_>>>()?;
+                if number(&raw, "count", 128)? != cards.len() as u64 {
+                    return Err(schema("serialized pile count"));
+                }
+                if let Some(k) = count
+                    && number(&b, k, 128)? != cards.len() as u64
+                {
+                    return Err(schema("pile count"));
+                }
+                if pile == "play_pile" && !cards.is_empty() {
+                    return Err(schema("settled combat turn"));
+                }
+                if pile == "draw_pile" {
+                    for c in &mut cards {
+                        c.as_object_mut().unwrap().remove("index");
+                    }
+                    cards.sort_by_cached_key(Value::to_string);
+                }
+                b[pile] = json!({"cards":cards,"count":cards.len()});
+            }
+            b["enemies"] = map_list(list(&b, "enemies", 32)?, |e| enemy(e, validate_power))?;
+            b["potions"] = map_list(list(&b, "potions", 16)?, potion)?;
+            let available = list(&b, "available_actions", 4)?;
+            if !available.contains(&json!("END_TURN"))
+                || available
+                    .iter()
+                    .any(|v| !matches!(v.as_str(), Some("PLAY" | "END_TURN" | "POTION")))
+            {
+                return Err(schema("available action kinds"));
+            }
+        }
+        Context::CardReward => {
+            string(&b, "current_room")?;
+            boolean(&b, "can_skip")?;
+            b["cards"] = map_list(list(&b, "cards", 16)?, |c| {
+                let c = card(c)?;
+                number(&c, "index", 255)?;
+                Ok(c)
+            })?;
+        }
+        Context::Map => {
+            b["nodes"] = map_list(list(&b, "nodes", 16)?, |n| node(n, false))?;
+        }
+    }
+    // The fields above allow the pinned shared envelope. Remove fields from
+    // other contexts even when an input redundantly includes them.
+    let mandatory = "type advice_for state_id request_id game_version mod_version player_count act act_name floor current_room run_state map";
+    let local = match context {
+        Context::Combat => {
+            "player hand draw_pile discard_pile exhaust_pile play_pile draw_pile_count discard_pile_count exhaust_pile_count enemies potions available_actions round room_type encounter_id allies orbs orb_capacity pets turn"
+        }
+        Context::CardReward => "cards can_skip",
+        Context::Map => "nodes",
+    };
+    b.as_object_mut().unwrap().retain(|k, _| {
+        mandatory
+            .split_ascii_whitespace()
+            .chain(local.split_ascii_whitespace())
+            .any(|x| x == k)
+    });
+    Ok(Observation { context, board: b })
+}

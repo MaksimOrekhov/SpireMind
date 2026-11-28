@@ -1,0 +1,688 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Value, json};
+use sts2_advisor::{
+    board, board_targets::BoardTargets, combat_mirror, graft, instinct_combat, instinct_screens,
+};
+use sts2_content::monster_dispatch::build_ai_for_version;
+use sts2_core::{
+    Card, CreatureUid, RelicId, card_by_uid,
+    cards::{EnchantmentId, VarKey},
+    creature_by_id, creature_by_id_mut,
+    hooks::effective_card_cost,
+    monster_ai::MonsterState,
+    run_manager::RunManager,
+};
+use sts2_e2e::{
+    build::Scope,
+    env::{Driver, Next},
+    net::E2eNet,
+    tokens::TokCache,
+};
+use sts2_wire::emit::{self, run_manager as run_wire};
+
+use super::observation::{Observation, boolean, list, number, point, schema, string};
+use crate::{
+    Failure, Result,
+    contract::{self, Context},
+    model::{self, BUILD},
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Action {
+    Play(u64, Option<u64>),
+    Potion(u64, Option<u64>),
+    EndTurn,
+    Reward(Option<u64>),
+    Move(u64),
+}
+
+impl Action {
+    pub(super) fn from_engine(value: &Value) -> Result<Self> {
+        let index = |field| number(value, field, 255);
+        let optional = |field: &str| {
+            if value.get(field) == Some(&Value::Null) {
+                Ok(None)
+            } else {
+                number(value, field, 255).map(Some)
+            }
+        };
+        match value["action"].as_str() {
+            Some("play") => Ok(Self::Play(index("card_index")?, optional("target_index")?)),
+            Some("end_turn") => Ok(Self::EndTurn),
+            Some("potion" | "drink_potion") => {
+                Ok(Self::Potion(index("slot")?, optional("target_index")?))
+            }
+            Some("pick_card_reward") => Ok(Self::Reward(optional("idx")?)),
+            Some("move") => Ok(Self::Move(index("col")?)),
+            _ => Err(coverage("Engine action has no supported mapping")),
+        }
+    }
+}
+
+fn coverage(message: &str) -> Failure {
+    Failure::new("action_coverage", message)
+}
+fn rebuild(message: &str) -> Failure {
+    Failure::new("reconstruction", message)
+}
+
+fn targets(b: &Value, card: &Value) -> Result<Vec<Option<u64>>> {
+    let indexes = list(card, "valid_target_indices", 32)?;
+    let kind = string(card, "target_type")?;
+    if kind != "AnyEnemy" {
+        if !indexes.is_empty()
+            || !matches!(
+                kind,
+                "None" | "Self" | "AllEnemies" | "RandomEnemy" | "TargetedNoCreature"
+            )
+        {
+            return Err(coverage("Playable card uses an unsupported target type"));
+        }
+        return Ok(vec![None]);
+    }
+    let enemies = list(b, "enemies", 32)?;
+    let mut sorted = BTreeSet::new();
+    for index in indexes {
+        let i = index
+            .as_u64()
+            .filter(|&i| i < enemies.len() as u64)
+            .ok_or_else(|| coverage("Invalid game target index"))?;
+        if enemies[i as usize]["is_alive"] != true
+            || enemies[i as usize]["is_hittable"] != true
+            || !sorted.insert(Some(i))
+        {
+            return Err(coverage(
+                "The game target list is inconsistent with its enemy list",
+            ));
+        }
+    }
+    if sorted.is_empty() {
+        return Err(coverage("Playable targeted card has no legal target"));
+    }
+    Ok(sorted.into_iter().collect())
+}
+
+fn enemy_detail(b: &Value, target: Option<u64>) -> Value {
+    target.map_or(Value::Null, |i| {
+        let enemy = &b["enemies"][i as usize];
+        json!({"enemy_index": i, "id": enemy["id"], "name": enemy["name"], "combat_id": enemy["combat_id"]})
+    })
+}
+
+fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action, Value>> {
+    let b = &obs.board;
+    let mut actions = BTreeMap::new();
+    match obs.context {
+        Context::Combat => {
+            let hand = list(b, "hand", 32)?;
+            let cs = rm
+                .combat
+                .as_ref()
+                .ok_or_else(|| rebuild("Combat state missing after graft"))?;
+            let mapping = BoardTargets::of(cs);
+            let enemies = list(b, "enemies", 32)?;
+            let native = b.get("native_current").is_some();
+            let slots = (0..cs.enemy_uids.len())
+                .filter(|&index| !native || mapping.to_board(index as i64).is_some())
+                .collect::<Vec<_>>();
+            if cs.player.hand.len() != hand.len() || slots.len() != enemies.len() {
+                return Err(coverage(
+                    "Hand or enemy indexes changed during reconstruction",
+                ));
+            }
+            for (i, (card, &uid)) in hand.iter().zip(&cs.player.hand).enumerate() {
+                let engine = card_by_uid(&cs.cards, uid)
+                    .ok_or_else(|| rebuild("Card instance missing after graft"))?;
+                if engine.card_id.to_python_name() != instinct_screens::registry_id(&card["id"])
+                    || engine.upgraded != (card["upgrade_level"] == 1)
+                    || card["effective_cost"].as_i64()
+                        != Some(i64::from(effective_card_cost(cs, uid)))
+                {
+                    return Err(coverage(
+                        "Card identity, upgrade or effective cost changed during reconstruction",
+                    ));
+                }
+                if boolean(card, "playable")? {
+                    for target in targets(b, card)? {
+                        let mut detail = json!({"kind":"play","card":{"hand_index":i,"id":card["id"],"name":card["name"],"effective_cost":card["effective_cost"],"upgrade_level":card["upgrade_level"],"enchantment":card["enchantment"],"affliction":card["affliction"]},"target":enemy_detail(b,target)});
+                        if native {
+                            detail["card"]["instance_id"] = card["instance_id"].clone();
+                        }
+                        actions.insert(Action::Play(i as u64, target), detail);
+                    }
+                }
+            }
+            for (e, index) in enemies.iter().zip(slots) {
+                let uid = cs.enemy_uids[index];
+                let enemy = creature_by_id(&cs.creatures, uid.0)
+                    .ok_or_else(|| rebuild("Enemy missing after graft"))?;
+                if instinct_screens::norm_id(&e["id"])
+                    != instinct_screens::norm_id(&json!(enemy.species.map(|s| s.python_name())))
+                    || e["hp"] != enemy.current_hp
+                    || e["block"] != enemy.block
+                    || e["max_hp"] != enemy.max_hp
+                {
+                    return Err(coverage(
+                        "Enemy identity or ordering changed during reconstruction",
+                    ));
+                }
+            }
+            actions.insert(Action::EndTurn, json!({"kind":"end_turn"}));
+            let mut use_potions = false;
+            let belt = list(b, "potions", 16)?;
+            if belt != list(&b["run_state"], "potions", 16)? {
+                return Err(coverage("Combat belt differs from the run belt"));
+            }
+            for (i, p) in belt.iter().enumerate() {
+                if p["slot"] != i {
+                    return Err(coverage("Potion slots are not in game order"));
+                }
+                if p["empty"] == true || p["can_use"] == false {
+                    continue;
+                }
+                use_potions = true;
+                if p["requires_target"] == true && p["target_type"] == "AnyEnemy" {
+                    if p["valid_target_indices"].is_null() {
+                        return Err(coverage(
+                            "The producer cannot prove all targets of this potion",
+                        ));
+                    }
+                    for target in targets(b, p)? {
+                        actions.insert(Action::Potion(i as u64, target),
+                            json!({"kind":"potion","slot":i,"id":p["id"],"name":p["name"],"target":enemy_detail(b, target)}));
+                    }
+                    continue;
+                }
+                // The session only admits one player. An AnyPlayer potion
+                // with no target picker can only address that player.
+                if p["requires_target"] == true
+                    || !matches!(
+                        p["target_type"].as_str(),
+                        Some(
+                            "None"
+                                | "Self"
+                                | "AnyPlayer"
+                                | "AllEnemies"
+                                | "RandomEnemy"
+                                | "TargetedNoCreature"
+                        )
+                    )
+                {
+                    return Err(coverage(
+                        "The producer cannot prove all targets of this potion",
+                    ));
+                }
+                actions.insert(
+                    Action::Potion(i as u64, None),
+                    json!({"kind":"potion","slot":i,"id":p["id"],"name":p["name"]}),
+                );
+            }
+            if use_potions != list(b, "available_actions", 4)?.contains(&json!("POTION")) {
+                return Err(coverage(
+                    "Potion availability differs from the game actions",
+                ));
+            }
+        }
+        Context::CardReward => {
+            let cards = list(b, "cards", 16)?;
+            if cards.is_empty() || rm.card_reward_options().len() != cards.len() {
+                return Err(coverage(
+                    "Card reward cannot be matched to the engine offer",
+                ));
+            }
+            let mut game_indexes = BTreeSet::new();
+            for (i, c) in cards.iter().enumerate() {
+                let index = number(c, "index", 255)?;
+                if !game_indexes.insert(index)
+                    || rm.card_reward_options()[i].to_python_name()
+                        != instinct_screens::registry_id(&c["id"])
+                    || rm.card_reward_upgraded_flags().get(i).copied()
+                        != Some(c["upgrade_level"] == 1)
+                {
+                    return Err(coverage(
+                        "Reward card identity or index changed during reconstruction",
+                    ));
+                }
+                actions.insert(Action::Reward(Some(i as u64)),json!({"kind":"reward_card","offer_index":index,"id":c["id"],"name":c["name"],"upgrade_level":c["upgrade_level"],"enchantment":c["enchantment"]}));
+            }
+            if boolean(b, "can_skip")? {
+                actions.insert(Action::Reward(None), json!({"kind":"skip"}));
+            }
+        }
+        Context::Map => {
+            let mut game_indexes = BTreeSet::new();
+            let grid = rm
+                .run_state
+                .current_act_map
+                .as_ref()
+                .ok_or_else(|| rebuild("Missing reconstructed map grid"))?;
+            if list(b, "nodes", 16)?.is_empty() {
+                return Err(coverage("The game reported no reachable map nodes"));
+            }
+            for n in list(b, "nodes", 16)? {
+                let (col, row) = point(n)?;
+                let index = number(n, "index", 255)?;
+                let position = sts2_core::map::MapCoord::new(col as i32, row as i32);
+                let visible_type_matches = list(&b["map"], "nodes", 256)?
+                    .iter()
+                    .find(|node| node["col"] == col && node["row"] == row)
+                    .map_or_else(
+                        || n["type"] == "Boss" && point(&b["map"]["boss"]).ok() == Some((col, row)),
+                        |node| node["type"] == n["type"],
+                    );
+                if !game_indexes.insert(index) || !visible_type_matches || (!grid.grid.contains_key(&position) && !grid.boss.is_some_and(|boss| grid.point(boss).coord == position))
+                    || actions.insert(Action::Move(col),json!({"kind":"move","node_index":index,"col":col,"row":row,"room_type":n["type"]})).is_some() {
+                    return Err(coverage("Ambiguous reachable node or unmatched map coordinate"));
+                }
+            }
+            // Comparing columns alone would silently accept a node on the wrong row.
+            let map_obs = &b["map"];
+            let current = if map_obs["current"].is_null() {
+                (3, 0)
+            } else {
+                point(&map_obs["current"])?
+            };
+            let row = current.1 + 1;
+            if actions.values().any(|n| n["row"] != row) {
+                return Err(coverage("Map choice does not lead to the next row"));
+            }
+        }
+    }
+    Ok(actions)
+}
+
+fn matches_telegraph(actual: &[Value], rebuilt: &[Value]) -> bool {
+    rebuilt.len() == actual.len()
+        && actual.iter().zip(rebuilt).all(|(known, sim)| {
+            instinct_screens::norm_id(&known["intent_type"])
+                == instinct_screens::norm_id(&sim["kind"])
+                && known.get("damage").is_none_or(|d| {
+                    sim.get("effective_amount").or_else(|| sim.get("amount")) == Some(d)
+                })
+                && known.get("hits").is_none_or(|h| {
+                    h.as_u64() == Some(sim.get("times").and_then(Value::as_u64).unwrap_or(1))
+                })
+        })
+}
+
+pub(super) fn check_telegraphs(b: &Value, rm: &mut RunManager, repair: bool) -> Result<()> {
+    let ascension = rm.ascension_level;
+    let cs = rm
+        .combat
+        .as_mut()
+        .ok_or_else(|| rebuild("Missing combat state"))?;
+    let telegraphs = emit::combat::enemy_telegraphs(cs)
+        .map_err(|_| rebuild("Could not read reconstructed telegraphs"))?;
+    let emitted = telegraphs
+        .as_array()
+        .ok_or_else(|| rebuild("Expected telegraph array"))?;
+    let enemies = list(b, "enemies", 32)?;
+    if emitted.len() != enemies.len() {
+        return Err(rebuild("Reconstructed enemy count differs"));
+    }
+    for (i, (e, row)) in enemies.iter().zip(emitted).enumerate() {
+        if e["is_alive"] == false
+            && !list(e, "powers", 64)?.iter().any(|power| {
+                super::powers::registry_id(power["id"].as_str().unwrap_or_default())
+                    == Some(sts2_core::PowerKind::Illusion)
+            })
+        {
+            continue;
+        }
+        let actual = list(e, "intents", 8)?;
+        let rebuilt = row
+            .as_array()
+            .ok_or_else(|| rebuild("Missing enemy telegraph"))?;
+        if matches_telegraph(actual, rebuilt) {
+            continue;
+        }
+        let missing = || rebuild("A visible intent or its shown damage could not be reconstructed");
+        if !repair
+            || actual.len() < 2
+            || !rebuilt
+                .first()
+                .is_some_and(|head| matches_telegraph(&actual[..1], std::slice::from_ref(head)))
+        {
+            return Err(missing());
+        }
+        // The seedless wire rebuild can retain the leading icon alone.
+        // The reconstructed head is already independently checked. Select
+        // the complete current move only when its entire display uniquely
+        // matches the versioned factory. The policy masks future moves.
+        let uid = CreatureUid(cs.enemy_uids[i].0);
+        let species = creature_by_id(&cs.creatures, uid.0)
+            .and_then(|c| c.species)
+            .ok_or_else(missing)?;
+        let mut ai = build_ai_for_version(
+            species,
+            Default::default(),
+            Default::default(),
+            ascension,
+            BUILD,
+        );
+        let (id, head) = {
+            let mut candidates = ai.states.iter().filter_map(|(id, state)| {
+                let MonsterState::Move(m) = state else {
+                    return None;
+                };
+                if m.intents.len() != actual.len() {
+                    return None;
+                }
+                let shown: Vec<_> = m
+                    .intents
+                    .iter()
+                    .map(|&intent| emit::combat::intent_to_value(intent, cs, uid))
+                    .collect();
+                matches_telegraph(actual, &shown).then(|| (*id, m.intents[0]))
+            });
+            let unique = candidates.next().ok_or_else(missing)?;
+            if candidates.next().is_some() {
+                return Err(missing());
+            }
+            unique
+        };
+        let creature = creature_by_id_mut(&mut cs.creatures, uid.0).ok_or_else(missing)?;
+        ai.force_current_state_unlogged(id);
+        creature.ai = Some(ai);
+        creature.intent = Some(head);
+    }
+    Ok(())
+}
+
+pub(super) fn enchantment_used_var(enchantment: EnchantmentId) -> Option<i32> {
+    let mut card = Card::pod_defaults();
+    match enchantment {
+        EnchantmentId::Glam => sts2_content::enchantments::mark_glam_used(&mut card),
+        EnchantmentId::Vigorous => sts2_content::enchantments::mark_vigorous_used(&mut card),
+        // The pinned core's EnchantmentUsed wire representation. In
+        // v0.111.0 these become used during OnPlay, before a settled board.
+        EnchantmentId::Swift => return Some(0b0100),
+        EnchantmentId::Sown => return Some(0b1000),
+        _ => return None,
+    }
+    Some(card.combat_var(VarKey::EnchantmentUsed))
+}
+
+pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<String>)> {
+    let mut board = public.clone();
+    // These two relics have acquisition behavior only in this build
+    // (RelicId::to_relic_kind returns None). They remain on the original
+    // run board for graft_run and for the encoder's run relic summary.
+    if let Some(relics) = board["run_state"]["relics"].as_array_mut() {
+        for relic in relics.iter_mut() {
+            if let Some(counter) = super::relics::combat_counter(relic)? {
+                relic["counter"] = json!(counter);
+            } else if let Some(id) = super::relics::id(relic) {
+                use sts2_e2e::snapshot::{engine_counter, engine_counter_unshown};
+                let id = id.to_python_name();
+                let counter = match relic["counter"].as_i64() {
+                    Some(shown) => engine_counter(id, shown),
+                    None => engine_counter_unshown(id),
+                };
+                if let Some(counter) = counter {
+                    relic["counter"] = json!(counter);
+                }
+            }
+        }
+        remove_pickup_only_relics(relics);
+    }
+    for power in board["player"]["powers"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(damage) = power["observer_self_damage"].as_i64() {
+            power["vars"] = json!({"SelfDamage": damage});
+        }
+    }
+    for enemy in board["enemies"].as_array_mut().into_iter().flatten() {
+        if super::observation::monster_kind(enemy) == Some(sts2_core::MonsterKind::BowlbugRock)
+            && enemy["intents"]
+                .as_array()
+                .is_some_and(|intents| intents.len() == 1)
+            && enemy["intents"][0]["intent_type"] == "Stun"
+        {
+            // The pinned creature has a single Stun move, which also proves
+            // its visible off-balance phase to the upstream importer.
+            enemy["next_move_id"] = json!("DIZZY");
+        }
+    }
+    let stamp = |cards: &mut Value| {
+        for row in cards.as_array_mut().into_iter().flatten() {
+            if row["observer_enchantment_status"] != "Disabled" {
+                continue;
+            }
+            let name = row["enchantment"].as_str().unwrap_or_default();
+            if let Some(used) =
+                EnchantmentId::from_wire_name(name.split(" / ").next().unwrap_or(name))
+                    .and_then(enchantment_used_var)
+            {
+                row["combat_vars"]["enchantment_used"] = json!(used);
+            }
+        }
+    };
+    stamp(&mut board["hand"]);
+    for pile in ["draw_pile", "discard_pile", "exhaust_pile", "play_pile"] {
+        stamp(&mut board[pile]["cards"]);
+    }
+    board::combat_wire(&board, Some("Ironclad"), i64::from(ascension), 0, 0)
+        .map_err(|_| rebuild("Upstream could not translate the combat board"))
+}
+
+pub(super) fn remove_pickup_only_relics(relics: &mut Vec<Value>) {
+    relics.retain(|r| {
+        !matches!(
+            super::relics::id(r),
+            Some(RelicId::NeowsSacrifice | RelicId::DowsingRod)
+        ) || r["is_wax"] == true
+            || r["is_melted"] == true
+    });
+}
+
+pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
+    let mut board = obs.board.clone();
+    if board["map"].is_null() {
+        return Err(Failure::new(
+            "missing_visible_map",
+            "No current map was observed for this position",
+        ));
+    }
+    board["seedless"] = json!(true);
+    if obs.context == Context::Map && board["map"]["current"].is_null() {
+        let map = &board["map"];
+        let start = list(map, "nodes", 256)?
+            .iter()
+            .filter(|node| node["row"] == 0)
+            .collect::<Vec<_>>();
+        if !list(map, "visited", 64)?.is_empty()
+            || start.len() != 1
+            || start[0]["type"] != "Ancient"
+            || start[0]["col"] != 3
+        {
+            return Err(rebuild(
+                "The visible map does not prove which entrance is current",
+            ));
+        }
+        // An unvisited entrance maps to the visible Ancient node. Upstream
+        // treats row 0 as parked at the act entrance.
+        board["map"]["current"] = json!({"col":3,"row":0});
+    }
+    if board["act"] == 1 {
+        board["act1"] = match board["act_name"].as_str() {
+            Some("Overgrowth" | "OVERGROWTH") => json!("overgrowth"),
+            Some("Underdocks" | "UNDERDOCKS") => json!("underdocks"),
+            _ => return Err(schema("first act variant")),
+        };
+    }
+    let (mut rm, notes) = graft::graft_run(&board, BUILD.as_str())
+        .map_err(|_| rebuild("Upstream seedless run graft did not reconstruct the state"))?;
+    if !notes.is_empty() {
+        return Err(rebuild(
+            "Upstream run graft reported missing data or approximated placement",
+        ));
+    }
+    match obs.context {
+        Context::Combat if board.get("native_current").is_some() => {
+            super::native_current::reconstruct(&board, &mut rm)?;
+        }
+        Context::Combat => {
+            let (wire, warnings) = combat_wire(&board, rm.ascension_level)?;
+            if !warnings.is_empty() {
+                return Err(rebuild("Upstream combat translation dropped a board item"));
+            }
+            let fight = combat_mirror::build_state(&wire)
+                .map_err(|_| rebuild("Upstream could not reconstruct combat"))?;
+            if !fight.intent_damage_known {
+                return Err(rebuild("Combat attack damage is incomplete"));
+            }
+            if instinct_combat::enter_live_combat(
+                &mut rm,
+                fight.state,
+                &board,
+                instinct_combat::room_kind(&board),
+            )
+            .is_some()
+            {
+                return Err(rebuild("The observed encounter is unsupported"));
+            }
+            check_telegraphs(&board, &mut rm, true)?;
+        }
+        Context::CardReward => {
+            let room = graft::live_room(&board)
+                .ok_or_else(|| rebuild("Missing current room for reward"))?;
+            sts2_wire::graft::set_room_type(&mut rm, room)
+                .map_err(|_| rebuild("Upstream could not reconstruct the current room"))?;
+            let cards = list(&board, "cards", 16)?
+                .iter()
+                .map(graft::card_spec)
+                .collect();
+            sts2_wire::graft::open_card_offer(
+                &mut rm,
+                &Value::Array(cards),
+                boolean(&board, "can_skip")?,
+                false,
+                None,
+            )
+            .map_err(|_| rebuild("Upstream could not reconstruct this card offer"))?;
+        }
+        Context::Map => {}
+    }
+    Ok(rm)
+}
+
+// No apply/step APIs on this path. The only changes are upstream debug grafts
+// on private, newly allocated state before a single peek.
+pub fn advise(net: &E2eNet, obs: &Observation) -> Result<Value> {
+    let _scope = Scope::enter(BUILD);
+    if let Some(result) = entrance_action(obs)? {
+        return Ok(result);
+    }
+    let mut rm = reconstruct(obs)?;
+    let (rows, actions) = checked_actions(obs, &rm)?;
+    if actions.len() == 1 {
+        return Ok(json!({"status":"forced","legal_actions":actions,"forced_action_id":0}));
+    }
+    let decision = checked_decision(obs, &mut rm, &rows)?;
+    let (logits, forward) = if obs.context == Context::Combat {
+        let row = model::observed_combat_row(net, &decision, &rm)?;
+        model::forward(net, &decision, &row)?
+    } else {
+        model::infer(net, &decision, &rm, &mut TokCache::new())?
+    };
+    let ranked = contract::rank(&decision.classes, &decision.members, &logits)?;
+    Ok(json!({"status":"ok","legal_actions":actions,"recommendations":ranked,"forward_ms":forward}))
+}
+
+pub(super) fn checked_actions(obs: &Observation, rm: &RunManager) -> Result<(Value, Vec<Value>)> {
+    let screen = screen_actions(obs, rm)?;
+    let engine = match obs.context {
+        Context::Combat => emit::legal_actions(
+            rm.combat
+                .as_ref()
+                .ok_or_else(|| rebuild("Missing combat after graft"))?,
+        ),
+        _ => run_wire::available_actions(rm),
+    };
+    let rows = engine
+        .as_array()
+        .ok_or_else(|| coverage("Expected engine action array"))?;
+    let targets = rm.combat.as_ref().map(BoardTargets::of);
+    let keys = rows
+        .iter()
+        .map(|row| {
+            if obs.board.get("native_current").is_some() {
+                let board_action = targets
+                    .as_ref()
+                    .and_then(|t| t.board_action(row))
+                    .ok_or_else(|| {
+                        coverage("A native action targets an enemy absent from the game board")
+                    })?;
+                Action::from_engine(&board_action)
+            } else {
+                Action::from_engine(row)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let set = keys.iter().copied().collect::<BTreeSet<_>>();
+    if rows.is_empty() || set.len() != rows.len() || !set.iter().copied().eq(screen.keys().copied())
+    {
+        return Err(coverage("Engine and visible game action sets differ"));
+    }
+    let actions = keys
+        .iter()
+        .enumerate()
+        .map(|(i, key)| json!({"action_id":i,"action":screen[key]}))
+        .collect::<Vec<_>>();
+    Ok((engine, actions))
+}
+
+pub(super) fn checked_decision(
+    obs: &Observation,
+    rm: &mut RunManager,
+    rows: &Value,
+) -> Result<Box<sts2_e2e::env::Decision>> {
+    let Next::Decision(decision) = Driver::new(0).peek(rm) else {
+        return Err(coverage(
+            "Upstream did not expose a scored decision for the full action set",
+        ));
+    };
+    if Context::from_dtype(decision.dtype).ok() != Some(obs.context)
+        || rows.as_array() != Some(&decision.actions)
+    {
+        return Err(coverage(
+            "Model decision and visible game action sets differ",
+        ));
+    }
+    Ok(decision)
+}
+
+fn entrance_action(obs: &Observation) -> Result<Option<Value>> {
+    let board = &obs.board;
+    let map = &board["map"];
+    if obs.context != Context::Map
+        || !map["current"].is_null()
+        || !list(map, "visited", 64)?.is_empty()
+        || list(map, "nodes", 256)?.iter().any(|node| node["row"] == 0)
+    {
+        return Ok(None);
+    }
+    let nodes = list(board, "nodes", 16)?;
+    // The pinned producer presents a separate initial room click. Its
+    // visible graph starts at row 1, so this click has no policy decision.
+    if let [node] = nodes
+        && point(node)? == (3, 0)
+        && ((board["floor"] == 0 && node["type"] == "Monster")
+            || (matches!(board["act"].as_u64(), Some(2 | 3))
+                && board["current_room"] == "Map"
+                && node["type"] == "Ancient"))
+    {
+        let index = number(node, "index", 255)?;
+        return Ok(Some(
+            json!({"status":"forced","forced_action_id":0,"legal_actions":[
+            {"action_id":0,"action":{"kind":"move","node_index":index,"col":3,"row":0,"room_type":node["type"]}}
+            ]}),
+        ));
+    }
+    Ok(None)
+}

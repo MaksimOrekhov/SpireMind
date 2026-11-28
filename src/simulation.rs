@@ -112,7 +112,7 @@ fn measure(samples: &mut [f64]) -> Value {
         "p50": percentile(50), "p95": percentile(95), "max": samples[samples.len() - 1]})
 }
 
-fn play(net: &E2eNet, seed: i64, deadline: Instant, samples: &mut Samples) -> Run {
+fn play(net: &E2eNet, seed: i64, deadline: Instant, samples: &mut Samples, combat_v2: bool) -> Run {
     let mut env = E2eEnv::new(seed);
     let mut cache = TokCache::new();
     let mut step = env.reset();
@@ -123,7 +123,12 @@ fn play(net: &E2eNet, seed: i64, deadline: Instant, samples: &mut Samples) -> Ru
         }
         match step {
             Step::Terminal(t) => break (t.outcome, t.error.or_else(|| t.cap.map(str::to_owned))),
-            Step::Decision(d) => match model::infer(net, &d, env.rm(), &mut cache) {
+            Step::Decision(d) => match if combat_v2 && d.is_combat() {
+                model::observed_combat_row(net, &d, env.rm())
+                    .and_then(|row| model::forward(net, &d, &row))
+            } else {
+                model::infer(net, &d, env.rm(), &mut cache)
+            } {
                 Ok((logits, ms)) => {
                     samples.add(d.dtype, ms);
                     step = env.step(argmax(&logits));
@@ -140,7 +145,7 @@ fn play(net: &E2eNet, seed: i64, deadline: Instant, samples: &mut Samples) -> Ru
     }
 }
 
-pub fn benchmark(net: &E2eNet, runs: u8, timeout: u64) -> (Value, bool) {
+pub fn benchmark(net: &E2eNet, runs: u8, timeout: u64, combat_v2: bool) -> (Value, bool) {
     let _scope = Scope::enter(BUILD);
     let start = Instant::now();
     let deadline = start + Duration::from_secs(timeout);
@@ -150,16 +155,21 @@ pub fn benchmark(net: &E2eNet, runs: u8, timeout: u64) -> (Value, bool) {
         if Instant::now() >= deadline {
             break;
         }
-        results.push(play(net, seed, deadline, &mut samples));
+        results.push(play(net, seed, deadline, &mut samples, combat_v2));
     }
     let count = |outcome| results.iter().filter(|r| r.outcome == outcome).count();
     let completed = count("won") + count("lost");
     let ok = completed == usize::from(runs);
+    let mut provenance = provenance();
+    if combat_v2 {
+        provenance["observation"] = json!(model::OBSERVED_COMBAT);
+        provenance["non_combat_observation"] = json!(model::OBSERVATION);
+    }
     (
         json!({
             "schema_version": 1,
             "status": if ok { "ok" } else { "partial" },
-            "provenance": provenance(),
+            "provenance": provenance,
             "requested": runs,
             "completed": completed,
             "wins": count("won"),

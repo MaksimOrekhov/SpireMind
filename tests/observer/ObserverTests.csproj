@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../.local/observer-source/spire-mentor-mod/SpireMindLease.cs" Link="SpireMindLease.cs" />
+    <Compile Include="../../patches/SpireMindCurrent.cs" Link="SpireMindCurrent.cs" />
+    <Compile Include="../../.local/observer-source/spire-mentor-mod/SpireMindCurrentSchema.cs" Link="SpireMindCurrentSchema.cs" />
+  </ItemGroup>
+</Project>

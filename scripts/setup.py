@@ -42,6 +42,15 @@ def setup_source():
     print(f"Spire Mentor {revision}")
 
 
+def check_source():
+    revision = (ROOT / "pins/upstream.rev").read_text(encoding="utf-8").strip()
+    if not (CHECKOUT / ".git").is_dir() or git("rev-parse", "--verify", "HEAD") != revision:
+        raise ValueError(f"expected Spire Mentor checkout at {revision}; run scripts/setup.py")
+    if git("status", "--porcelain", "--untracked-files=all"):
+        raise ValueError(".local/upstream contains modifications; build requires the pinned source")
+    print(f"Verified clean Spire Mentor {revision}")
+
+
 def verify_weights(path, pin):
     with path.open("rb") as weights:
         digest = hashlib.file_digest(weights, "sha256").hexdigest()
@@ -68,12 +77,18 @@ def setup_weights():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source-only", action="store_true", help="skip the model download")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--source-only", action="store_true", help="skip the model download")
+    mode.add_argument("--check-source", action="store_true", help="verify the pinned checkout without fetching or changing it")
     args = parser.parse_args()
     try:
-        setup_source()
-        if not args.source_only:
-            setup_weights()
+        if args.check_source:
+            check_source()
+        else:
+            setup_source()
+            check_source()
+            if not args.source_only:
+                setup_weights()
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"Setup failed: {error}\n")
 
