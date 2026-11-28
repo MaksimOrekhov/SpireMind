@@ -2,15 +2,18 @@
 //! This module has no access to the live connection.
 use serde_json::{Value, json};
 use sts2_core::{
-    Card, CombatState, LocalCostMod, card_by_uid,
-    cards::{TargetType, VarKey, effective_target_type},
-    creature_by_id, potion_effects,
+    Card, CombatState, LocalCostMod, RelicId, card_by_uid,
+    cards::{CardType, TargetType, VarKey, effective_target_type},
+    creature_by_id,
+    event_log::EventLogEntry,
+    potion_effects,
     potions::PotionTargetType,
     run_manager::RunManager,
 };
 use sts2_e2e::snapshot;
 use sts2_wire::emit::{self, run_manager as run_wire};
 
+use super::relics;
 use crate::{Failure, Result, model::BUILD};
 
 fn projection(message: &str) -> Failure {
@@ -135,10 +138,14 @@ fn powers(wire: &Value) -> Vec<Value> {
     rows(wire)
         .iter()
         .map(|p| {
-            json!({
+            let mut public = json!({
                 "id":p["name"],"name":p["name"],"amount":p["amount"],
                 "display_amount":p["display_amount"],"observer_visible":true
-            })
+            });
+            if p["name"] == "CRIMSON_MANTLE" {
+                public["observer_self_damage"] = p["counter"].clone();
+            }
+            public
         })
         .collect()
 }
@@ -249,6 +256,29 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
             if let Some(v) = snapshot::display_counter(id, counter) {
                 relic["counter"] = json!(v);
             }
+            if let Some(values) = relics::status_values(*kind)
+                && let Some((status, _)) =
+                    values.into_iter().find(|(_, c)| i64::from(*c) == counter)
+            {
+                relic["observer_relic_status"] = json!(status);
+            }
+            match kind {
+                RelicId::CentennialPuzzle => {
+                    relic["observer_trigger_seen"] =
+                        json!(cs.combat_log.unblocked_damage_received_this_combat > 0);
+                }
+                RelicId::Permafrost
+                    if cs.combat_log.event_log.recording()
+                        && cs.combat_log.event_log.dropped() == 0 =>
+                {
+                    relic["observer_trigger_seen"] =
+                        json!(cs.combat_log.event_log.rows().iter().any(|row|
+                        matches!(row.entry, EventLogEntry::CardPlayFinished { card, upgraded }
+                            if sts2_content::cards::spec_index::card_pod_from_id(card, upgraded)
+                                .is_some_and(|card| card.card_type == CardType::Power))));
+                }
+                _ => {}
+            }
             for key in ["is_wax", "is_melted"] {
                 if let Some(v) = combat_relic.and_then(|row| row.get(key)) {
                     relic[key] = v.clone();
@@ -317,7 +347,8 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
         "game_version":BUILD.as_str(),"mod_version":super::observation::MOD,
         "player_count":1,"act":run.act_index,"act_name":act,"floor":run.game_floor(),
         "current_room":room,"room_type":room,"encounter_id":run_wire::combat_encounter_id(rm),
-        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1,"spiremind_card_status":1,"spiremind_potion_targets":1},
+        "capabilities":{"spiremind_lease":1,"spiremind_power_visibility":1,"spiremind_card_status":1,"spiremind_potion_targets":1,
+            "spiremind_relic_witness":1,"spiremind_power_tooltip":1},
         "map":map(rm)?,"player":public_player,"enemies":enemies,
         "run_state":{"character":"IRONCLAD","game_mode":"standard","ascension":rm.ascension_level,
             "hp":player["hp"],"max_hp":player["max_hp"],"gold":run_wire::gold(rm),"relics":relics,

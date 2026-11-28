@@ -46,7 +46,7 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
         (
             Barricade | Clarity | Colossus | Corruption | Cruelty | DarkEmbrace | DemonForm
             | FeelNoPain | FlexPotion | NoDraw | Rage | RetainHand | Rupture | SetupStrike
-            | SpeedPotion,
+            | SpeedPotion | SelfFormingClay | Pyre | FreeAttack,
             Owner::Player,
         ) => ("visible_amount", "Pinned hooks read presence or amount"),
         (Shrink, _) | (Ravenous | Shriek | Slippery | Suck, Owner::Enemy) => (
@@ -56,6 +56,10 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
         (Minion, Owner::Enemy) => (
             "visible_amount",
             "Pinned engine checks presence for secondary enemies",
+        ),
+        (Imbalanced, Owner::Enemy) => (
+            "visible_amount",
+            "Bowlbug Rock's off-balance state is carried by its current Stun telegraph; the power stores no countdown",
         ),
         (Stampede, Owner::Player) => (
             "visible_amount",
@@ -89,7 +93,11 @@ pub(super) fn requirement(kind: PowerKind, owner: Owner) -> (&'static str, &'sta
             "public_history",
             "Producer and upstream count block entries from finished card plays this turn",
         ),
-        (CrimsonMantle | Inferno | ToricToughness | PainfulStabs, _) => (
+        (CrimsonMantle, Owner::Player) => (
+            "public_parameter",
+            "SelfDamage is printed by the pinned smart tooltip independently of the visible Block amount",
+        ),
+        (Inferno | ToricToughness | PainfulStabs, _) => (
             "public_parameter_pending",
             "Upstream maps a DynamicVar; public provenance and semantics require verification",
         ),
@@ -122,6 +130,13 @@ pub(super) fn validate(value: &Value, owner: Owner) -> Result<()> {
         ("visible_amount" | "public_history", _) => legacy(kind) || shown == Some(amount),
         ("public_parameter", PowerKind::Slow) => {
             amount == 1 && shown.is_some_and(|n| n >= 0 && n % 10 == 0)
+        }
+        ("public_parameter", PowerKind::CrimsonMantle) => {
+            amount > 0
+                && shown == Some(amount)
+                && value["observer_self_damage"]
+                    .as_i64()
+                    .is_some_and(|n| n > 0)
         }
         _ => false,
     } {

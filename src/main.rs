@@ -79,9 +79,14 @@ enum Mode {
         runs: u8,
         #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u32).range(10..=4000))]
         steps_per_run: u32,
+        /// Use explicit new seeds after adapter development is complete.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..i64::MAX - 16))]
+        first_seed: Option<i64>,
     },
     /// List observation compatibility for the pinned upstream power registry.
     PowerMatrix,
+    /// Compare both possible Ruined Helmet latch values in bounded offline fixtures.
+    UncertaintyPoc,
     /// Show read-only recommendations from Spire Mentor's local Advisor lane.
     Live {
         #[arg(long, default_value_t = 9002, value_parser = clap::value_parser!(u16).range(1..))]
@@ -147,12 +152,14 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             | Mode::Benchmark { .. }
             | Mode::Compatibility { .. }
             | Mode::HeldOut { .. }
+            | Mode::UncertaintyPoc
     ) {
         model::check_build(cli.game_version.as_deref().unwrap_or(BUILD.as_str()))?;
     }
     let path = cli.weights.unwrap_or_else(model::default_weights);
     let net = model::load(&path)?;
     match cli.command {
+        Mode::UncertaintyPoc => Ok((live::compatibility::uncertainty_poc(&net)?, true)),
         Mode::Recommend {
             context,
             seed,
@@ -182,8 +189,9 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
         Mode::HeldOut {
             runs,
             steps_per_run,
+            first_seed,
         } => Ok((
-            live::compatibility::held_out(&net, runs, steps_per_run as usize)?,
+            live::compatibility::held_out(&net, runs, steps_per_run as usize, first_seed)?,
             true,
         )),
         Mode::Live {

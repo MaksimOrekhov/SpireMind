@@ -2,7 +2,10 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value, json};
 
-use super::powers::{self, Owner};
+use super::{
+    powers::{self, Owner},
+    relics,
+};
 use crate::{Failure, Result, contract::Context};
 
 pub const MOD: &str = "0.11.10";
@@ -293,29 +296,10 @@ fn combat_card(value: &Value, evidence: CardEvidence) -> Result<Value> {
     Ok(c)
 }
 
-fn has_private_relic_latch(id: &str) -> bool {
-    use sts2_core::RelicId;
-
-    let id =
-        sts2_content::names::relic_id_from_str_any_build(id.strip_prefix("RELIC.").unwrap_or(id));
-    matches!(
-        id,
-        Some(
-            RelicId::Vambrace
-                | RelicId::RuinedHelmet
-                | RelicId::Permafrost
-                | RelicId::CentennialPuzzle
-                | RelicId::UnsettlingLamp
-                | RelicId::ThrowingAxe
-                | RelicId::LizardTail
-        )
-    )
-}
-
 pub(super) fn relic(value: &Value) -> Result<Value> {
     let mut r = object(
         value,
-        "id name counter stack_count is_wax is_melted status",
+        "id name counter stack_count is_wax is_melted status observer_relic_status observer_trigger_seen",
         "description rarity",
         "relic",
     )?;
@@ -333,13 +317,22 @@ pub(super) fn relic(value: &Value) -> Result<Value> {
     }
     // The pinned producer overloads counter with these private spent bits
     // even when ShowCounter is false. Keep them out of run features and diagnostics.
-    if has_private_relic_latch(id) {
+    if relics::id(&r).is_some_and(relics::has_private_latch) {
         r.as_object_mut()
             .expect("validated relic")
             .remove("counter");
     } else {
         ints(&r, "counter", -1000..=1000)?;
     }
+    if !r["observer_relic_status"].is_null()
+        && !matches!(
+            r["observer_relic_status"].as_str(),
+            Some("normal" | "active" | "disabled")
+        )
+    {
+        return Err(schema("relic observer status"));
+    }
+    primitive_fields(&r, &["observer_trigger_seen"], Value::is_boolean)?;
     ints(&r, "stack_count", 0..=1000)?;
     Ok(r)
 }
@@ -384,7 +377,7 @@ pub(super) fn power(value: &Value, owner: Owner) -> Result<Value> {
     }
     let p = object(
         value,
-        "id name amount display_amount",
+        "id name amount display_amount observer_self_damage",
         "description type stack_type target applier player_target vars instance_id observer_visible",
         "power",
     )?;
@@ -397,6 +390,14 @@ pub(super) fn power(value: &Value, owner: Owner) -> Result<Value> {
         return Err(schema("power amount"));
     }
     ints(&p, "display_amount", -10_000..=10_000)?;
+    ints(&p, "observer_self_damage", 0..=1000)?;
+    if !p["observer_self_damage"].is_null()
+        && !(owner == Owner::Player
+            && p["id"].as_str().and_then(powers::registry_id)
+                == Some(sts2_core::PowerKind::CrimsonMantle))
+    {
+        return Err(schema("power tooltip witness"));
+    }
     // Never pass raw counters or dynamic vars through to the importer.
     powers::validate(&p, owner)?;
     Ok(p)
@@ -431,6 +432,12 @@ pub(super) fn intent(value: &Value) -> Result<Value> {
     Ok(i)
 }
 
+pub(super) fn monster_kind(value: &Value) -> Option<sts2_core::MonsterKind> {
+    value["id"]
+        .as_str()
+        .and_then(sts2_wire::state_dict::monster_kind_from_python_name)
+}
+
 pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
     let e = object(
         value,
@@ -438,14 +445,18 @@ pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
         "side is_player is_monster next_move_id move_state move_history ai forecast fabricator_last_spawned curse_of_knowledge_counter",
         "enemy",
     )?;
-    let id = string(&e, "id")?;
-    if id == "THIEVING_HOPPER" {
+    string(&e, "id")?;
+    let kind = monster_kind(&e);
+    if kind == Some(sts2_core::MonsterKind::ThievingHopper) {
         return Err(Failure::new(
             "card_public_state_missing",
             "The thief needs card deck provenance that the producer does not identify",
         ));
     }
-    if matches!(id, "FABRICATOR" | "KNOWLEDGE_DEMON") {
+    if matches!(
+        kind,
+        Some(sts2_core::MonsterKind::Fabricator | sts2_core::MonsterKind::KnowledgeDemon)
+    ) {
         return Err(Failure::new(
             "unsupported_mechanic",
             "Encounter needs private counters",
@@ -472,6 +483,16 @@ pub(super) fn enemy_envelope(value: &Value) -> Result<Value> {
 fn enemy(value: &Value, validate_power: fn(&Value, Owner) -> Result<Value>) -> Result<Value> {
     let mut e = enemy_envelope(value)?;
     e["powers"] = map_list(list(&e, "powers", 64)?, |p| validate_power(p, Owner::Enemy))?;
+    if monster_kind(&e) != Some(sts2_core::MonsterKind::BowlbugRock)
+        && list(&e, "powers", 64)?.iter().any(|p| {
+            p["id"].as_str().and_then(powers::registry_id) == Some(sts2_core::PowerKind::Imbalanced)
+        })
+    {
+        return Err(Failure::new(
+            "unsupported_mechanic",
+            "Imbalanced needs the observed Bowlbug Rock telegraph",
+        ));
+    }
     if e["is_alive"] == false
         && list(&e, "powers", 64)?.iter().any(|p| {
             p["id"].as_str().and_then(powers::registry_id) == Some(sts2_core::PowerKind::Illusion)
@@ -632,6 +653,24 @@ pub fn sanitize(raw: &Value, context: Context) -> Result<Observation> {
 
 pub(super) fn sanitize_live(raw: &Value, context: Context) -> Result<Observation> {
     confirm_power_capability(raw)?;
+    if raw["capabilities"]["spiremind_relic_witness"] != 1
+        && raw["run_state"]["relics"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|r| !r["observer_relic_status"].is_null() || !r["observer_trigger_seen"].is_null())
+    {
+        return Err(schema("relic witness capability"));
+    }
+    if raw["capabilities"]["spiremind_power_tooltip"] != 1
+        && raw["player"]["powers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|p| !p["observer_self_damage"].is_null())
+    {
+        return Err(schema("power tooltip capability"));
+    }
     if context == Context::Combat
         && raw["capabilities"]["spiremind_potion_targets"] != 1
         && [&raw["potions"], &raw["run_state"]["potions"]]
@@ -711,14 +750,8 @@ fn project(
             if number(&b, "round", 1000)? == 0 {
                 return Err(schema("combat round"));
             }
-            if list(&b["run_state"], "relics", 128)?
-                .iter()
-                .any(|r| r["id"].as_str().is_some_and(has_private_relic_latch))
-            {
-                return Err(Failure::new(
-                    "relic_public_state_missing",
-                    "A combat relic has no verified public spent-state carrier",
-                ));
+            for relic in list(&b["run_state"], "relics", 128)? {
+                relics::combat_counter(relic)?;
             }
             for k in ["orbs", "pets", "allies"] {
                 if !list(&b, k, 16)?.is_empty() {

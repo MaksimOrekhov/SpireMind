@@ -212,7 +212,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
      /// recap / autopsy records.</summary>
 -    private static Dictionary<string, object> ModCapabilities() => new() { ["coach"] = 2 };
 +    private static Dictionary<string, object> ModCapabilities() =>
-+        new() { ["coach"] = 2, ["spiremind_lease"] = 1, ["spiremind_power_visibility"] = 1, ["spiremind_card_status"] = 1, ["spiremind_potion_targets"] = 1 };
++        new() { ["coach"] = 2, ["spiremind_lease"] = 1, ["spiremind_power_visibility"] = 1, ["spiremind_card_status"] = 1, ["spiremind_potion_targets"] = 1, ["spiremind_relic_witness"] = 1, ["spiremind_power_tooltip"] = 1 };
 +
 +    private static string? ObserverKey(SimScreenDecision screen)
 +    {
@@ -289,9 +289,7 @@ diff --git a/spire-mentor-mod/SimAdvisor.cs b/spire-mentor-mod/SimAdvisor.cs
 diff --git a/spire-mentor-mod/SimStateExtractor.cs b/spire-mentor-mod/SimStateExtractor.cs
 --- a/spire-mentor-mod/SimStateExtractor.cs
 +++ b/spire-mentor-mod/SimStateExtractor.cs
-@@ -480,5 +480,9 @@
-             int enchAmount = 0;
-             try { enchAmount = enchantment.Amount; } catch { }
+@@ -482,4 +482,8 @@
              if (enchAmount != 0)
                  data["enchantment_amount"] = enchAmount;
 +            // The same state NCard uses to draw the enchantment tab.
@@ -299,8 +297,56 @@ diff --git a/spire-mentor-mod/SimStateExtractor.cs b/spire-mentor-mod/SimStateEx
 +            if (enchantment.Id.Entry is "GLAM" or "VIGOROUS" or "SOWN" or "SWIFT")
 +                data["observer_enchantment_status"] = SafeString(() => enchantment.Status.ToString());
          }
-@@ -1082,5 +1086,14 @@
+
+@@ -1014,9 +1018,10 @@
+     }
+
+-    private static int? SafeRelicCounter(RelicModel relic)
++    private static int? SafeRelicCounter(RelicModel relic, bool publicObservation)
+     {
          try
+         {
+             if (relic.ShowCounter) return SettledDisplayAmount(relic);
++            if (publicObservation) return null;
+             var (latch, spent) = relic.Id.Entry switch
+             {
+@@ -1046,6 +1051,24 @@
+     /// <see cref="SafeRelicCounter"/>.
+     /// </summary>
++    private static bool? ObserverTriggerSeen(RelicModel relic)
++    {
++        if (relic.Id.Entry is not ("PERMAFROST" or "CENTENNIAL_PUZZLE"))
++            return null;
++        var manager = CombatManager.Instance;
++        var creature = relic.Owner?.Creature;
++        var state = manager?.DebugOnlyGetState();
++        if (state == null || manager?.IsInProgress != true || creature?.CombatState != state)
++            return null;
++        var history = manager.History;
++        return relic.Id.Entry == "PERMAFROST"
++            ? history.CardPlaysFinished.Any(e =>
++                e.CardPlay?.Card is CardModel card && card.Owner == relic.Owner && card.Type == CardType.Power)
++            : history.Entries.OfType<DamageReceivedEntry>().Any(e =>
++                e.Receiver == creature && e.Result.UnblockedDamage > 0);
++    }
++
+     public static Dictionary<string, object?> SerializeRelic(RelicModel relic)
+     {
++        bool publicObservation = SimRuntime.Mode == SimMode.Advisor;
+         try
+         {
+@@ -1056,5 +1079,9 @@
+                 ["description"] = relic.DynamicDescription.GetFormattedText(),
+                 ["rarity"] = relic.Rarity.ToString(),
+-                ["counter"] = SafeRelicCounter(relic),
++                ["counter"] = SafeRelicCounter(relic, publicObservation),
++                ["observer_relic_status"] = publicObservation
++                    && relic.Id.Entry is "VAMBRACE" or "UNSETTLING_LAMP" or "THROWING_AXE" or "LIZARD_TAIL"
++                    ? relic.Status.ToString().ToLowerInvariant() : null,
++                ["observer_trigger_seen"] = publicObservation ? ObserverTriggerSeen(relic) : null,
+                 ["stack_count"] = relic.StackCount,
+                 ["is_wax"] = relic.IsWax,
+@@ -1084,4 +1111,13 @@
          {
              TargetType targetType = potion.TargetType;
 +            IReadOnlyList<Creature>? enemies = potion.Owner?.Creature?.CombatState?.Enemies;
@@ -314,22 +360,21 @@ diff --git a/spire-mentor-mod/SimStateExtractor.cs b/spire-mentor-mod/SimStateEx
 +            }
              return new Dictionary<string, object?>
              {
-@@ -1095,6 +1108,7 @@
-                 ["can_use"] = potion.Usage != PotionUsage.Automatic,
+@@ -1096,4 +1132,5 @@
                  ["target_type"] = targetType.ToString(),
                  ["requires_target"] = targetType == TargetType.AnyEnemy,
 +                ["valid_target_indices"] = validTargets,
              };
          }
-         catch (Exception ex)
-@@ -1336,6 +1350,7 @@
-             var d = new Dictionary<string, object?>
+@@ -1337,4 +1374,8 @@
              {
                  ["id"] = power.Id.Entry,
 +                ["observer_visible"] = power.IsVisible,
++                // The pinned in-combat smart tooltip prints its SelfDamage argument.
++                ["observer_self_damage"] = power.IsVisible && power.Id.Entry is "CRIMSON_MANTLE" or "CRIMSON_MANTLE_POWER"
++                    ? power.DynamicVars["SelfDamage"].IntValue : null,
                  ["name"] = power.Title.GetFormattedText(),
                  ["amount"] = power.Amount,
-                 // `Amount` is not always the number the power runs on.
 diff --git a/spire-mentor-mod/SpireMindLease.cs b/spire-mentor-mod/SpireMindLease.cs
 new file mode 100644
 --- /dev/null

@@ -3,6 +3,7 @@ mod diagnostics;
 mod engine;
 mod observation;
 mod powers;
+mod relics;
 mod session;
 mod sim_observation;
 #[cfg(test)]

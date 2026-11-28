@@ -398,6 +398,21 @@ pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<S
     // (RelicId::to_relic_kind returns None). They remain on the original
     // run board for graft_run and for the encoder's run relic summary.
     if let Some(relics) = board["run_state"]["relics"].as_array_mut() {
+        for relic in relics.iter_mut() {
+            if let Some(counter) = super::relics::combat_counter(relic)? {
+                relic["counter"] = json!(counter);
+            } else if let Some(id) = super::relics::id(relic) {
+                use sts2_e2e::snapshot::{engine_counter, engine_counter_unshown};
+                let id = id.to_python_name();
+                let counter = match relic["counter"].as_i64() {
+                    Some(shown) => engine_counter(id, shown),
+                    None => engine_counter_unshown(id),
+                };
+                if let Some(counter) = counter {
+                    relic["counter"] = json!(counter);
+                }
+            }
+        }
         relics.retain(|r| {
             let kind = r["id"].as_str().and_then(|id| {
                 sts2_content::names::relic_id_from_str_any_build(
@@ -408,6 +423,27 @@ pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<S
                 || r["is_wax"] == true
                 || r["is_melted"] == true
         });
+    }
+    for power in board["player"]["powers"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(damage) = power["observer_self_damage"].as_i64() {
+            power["vars"] = json!({"SelfDamage": damage});
+        }
+    }
+    for enemy in board["enemies"].as_array_mut().into_iter().flatten() {
+        if super::observation::monster_kind(enemy) == Some(sts2_core::MonsterKind::BowlbugRock)
+            && enemy["intents"]
+                .as_array()
+                .is_some_and(|intents| intents.len() == 1)
+            && enemy["intents"][0]["intent_type"] == "Stun"
+        {
+            // The pinned creature has a single Stun move, which also proves
+            // its visible off-balance phase to the upstream importer.
+            enemy["next_move_id"] = json!("DIZZY");
+        }
     }
     let stamp = |cards: &mut Value| {
         for row in cards.as_array_mut().into_iter().flatten() {

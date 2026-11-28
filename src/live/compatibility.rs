@@ -18,6 +18,9 @@ use super::{
 };
 use crate::{Failure, Result, contract::Context, model, simulation::FIRST_SEED};
 
+type Outcomes = BTreeMap<&'static str, usize>;
+type Breakdown = BTreeMap<String, Outcomes>;
+
 pub fn power_matrix() -> Value {
     let ironclad = sts2_core::powers::ironclad::ironclad_power_kinds();
     // The wire parser resolves the first kind with a given public ID.
@@ -61,7 +64,7 @@ struct Report {
     semantic_positions: usize,
     public_collisions: usize,
     duplicates: usize,
-    outcomes: BTreeMap<&'static str, usize>,
+    outcomes: Outcomes,
     blocked: BTreeMap<String, usize>,
     blocker_details: BTreeMap<String, usize>,
     powers: BTreeMap<String, BTreeMap<&'static str, usize>>,
@@ -87,6 +90,11 @@ struct Report {
     importer_warnings: BTreeMap<String, usize>,
     first_failure_by_encounter: BTreeMap<String, BTreeMap<String, usize>>,
     invariance_strata: BTreeSet<(u8, bool, bool, bool)>,
+    outcomes_by_act: Breakdown,
+    outcomes_by_room: Breakdown,
+    outcomes_by_encounter: Breakdown,
+    outcomes_by_relic: Breakdown,
+    relic_counter_diffs: BTreeMap<String, usize>,
 }
 
 fn rows(value: &Value) -> &[Value] {
@@ -271,6 +279,29 @@ fn compare(
     let rebuilt =
         sts2_e2e::snapshot::state_dict(candidate.combat.as_ref().expect("checked combat"))
             .map_err(|_| mismatch("sim_projection", "Cannot export reconstructed combat"))?;
+    for relic in rows(&obs.board["run_state"]["relics"]) {
+        if let Some(id) =
+            super::relics::id(relic).filter(|&id| super::relics::has_private_latch(id))
+        {
+            let counter = |wire: &Value| {
+                rows(&wire["player"]["relics"])
+                    .iter()
+                    .find(|r| r["id"] == id.to_python_name())
+                    .and_then(|r| r["counter"].as_i64())
+                    .unwrap_or_default()
+            };
+            if counter(&base) != counter(&rebuilt) {
+                return Err(mismatch(
+                    "sim_relic_parity",
+                    "Public relic witness differs from native combat",
+                ));
+            }
+            *report
+                .checks
+                .entry("exact_public_relic_counters")
+                .or_default() += 1;
+        }
+    }
     let power_signature = |wire: &Value| {
         let collect = |holder: &Value| {
             rows(&holder["powers"])
@@ -334,7 +365,24 @@ fn compare(
         *report.checks.entry("exact_masked_tokens").or_default() += 1;
     } else {
         *report.checks.entry("different_masked_tokens").or_default() += 1;
-        for field in different_token_fields(&expected, &actual) {
+        let fields = different_token_fields(&expected, &actual);
+        if fields.contains("RELIC.R_CTR") {
+            use sts2_e2e::snapshot::display_counter;
+            for row in rows(&base["player"]["relics"]) {
+                let Some(id) = row["id"].as_str() else {
+                    continue;
+                };
+                let left = display_counter(id, row["counter"].as_i64().unwrap_or_default());
+                let right = rows(&rebuilt["player"]["relics"])
+                    .iter()
+                    .find(|r| r["id"] == id)
+                    .and_then(|r| display_counter(id, r["counter"].as_i64().unwrap_or_default()));
+                if left != right {
+                    *report.relic_counter_diffs.entry(id.to_owned()).or_default() += 1;
+                }
+            }
+        }
+        for field in fields {
             *report.token_diff.entry(field).or_default() += 1;
         }
     }
@@ -368,7 +416,12 @@ fn compare(
 }
 
 impl Report {
-    fn evaluate(&mut self, rm: &RunManager, actions: &Value, net: Option<&E2eNet>) {
+    fn evaluate(
+        &mut self,
+        rm: &RunManager,
+        actions: &Value,
+        net: Option<&E2eNet>,
+    ) -> Option<&'static str> {
         let raw = match sim_observation::combat(rm, actions) {
             Ok(raw) => raw,
             Err(err) => {
@@ -379,7 +432,7 @@ impl Report {
                     .entry(format!("{}: {}", err.code, err.message))
                     .or_default() += 1;
                 *self.outcomes.entry("projection_error").or_default() += 1;
-                return;
+                return Some("projection_error");
             }
         };
         let public = comparable_board(raw.clone());
@@ -391,7 +444,7 @@ impl Report {
                     .blocked
                     .entry(format!("{}: {}", err.code, err.message))
                     .or_default() += 1;
-                return;
+                return Some("projection_error");
             }
         };
         if !record_position(
@@ -399,7 +452,7 @@ impl Report {
             format!("{:x}", Sha256::digest(public.to_string())),
             semantic,
         ) {
-            return;
+            return None;
         }
         let ids = list_powers(&raw)
             .filter_map(|(p, _)| p["id"].as_str())
@@ -428,7 +481,9 @@ impl Report {
             // Generation provenance is read by the thief and Fool handlers,
             // outside the admitted solo Ironclad board.
             let known = match key {
-                VarKey::GeneratedInCombat => enemies.iter().all(|e| e["id"] != "THIEVING_HOPPER"),
+                VarKey::GeneratedInCombat => enemies
+                    .iter()
+                    .all(|e| observation::monster_kind(e) != Some(MonsterKind::ThievingHopper)),
                 VarKey::ReturnIfPlayedRound => matches!(id, "BOLAS" | "THRUMMING_HATCHET"),
                 // This lifespan is updated by RunManager at combat exit.
                 VarKey::Generic => id == "GUILTY",
@@ -606,6 +661,7 @@ impl Report {
                 .entry(outcome)
                 .or_default() += 1;
         }
+        Some(outcome)
     }
 }
 
@@ -645,9 +701,13 @@ fn walk(
     let mut cache = TokCache::new();
     let mut ending = json!({"seed":seed,"status":"step_limit"});
     let mut acts = BTreeSet::new();
+    let mut outcomes = Outcomes::new();
     for step in 0..steps {
         acts.insert(rm.run_state.act_index);
         let next = driver.peek(&mut rm);
+        if let Some(cs) = &mut rm.combat {
+            cs.combat_log.event_log.set_recording(true);
+        }
         let combat_decision = match &next {
             Next::Decision(d) => Context::from_dtype(d.dtype).ok() == Some(Context::Combat),
             Next::Forced(f) => matches!(f.kind, ApplyKind::Combat),
@@ -658,7 +718,31 @@ fn walk(
             && emit::pending_choice(cs).is_none()
         {
             let actions = emit::legal_actions(cs);
-            report.evaluate(&rm, &actions, net);
+            if let Some(outcome) = report.evaluate(&rm, &actions, net) {
+                let record = |by: &mut Breakdown, id: String| {
+                    *by.entry(id).or_default().entry(outcome).or_default() += 1;
+                };
+                *outcomes.entry(outcome).or_default() += 1;
+                record(
+                    &mut report.outcomes_by_act,
+                    rm.run_state.act_index.to_string(),
+                );
+                if let Some(room) = rm.run_state.current_room {
+                    record(
+                        &mut report.outcomes_by_room,
+                        format!("{:?}", room.room_type),
+                    );
+                }
+                if let Some(encounter) = sts2_wire::emit::run_manager::combat_encounter_id(&rm) {
+                    record(&mut report.outcomes_by_encounter, encounter.to_owned());
+                }
+                for relic in rm.run_state.relics.iter().copied().collect::<BTreeSet<_>>() {
+                    record(
+                        &mut report.outcomes_by_relic,
+                        relic.to_python_name().to_owned(),
+                    );
+                }
+            }
         }
         let (action, kind) = match next {
             Next::Decision(d) => {
@@ -688,6 +772,18 @@ fn walk(
         }
     }
     ending["acts"] = json!(acts);
+    ending["outcomes"] = json!(outcomes);
+    ending["denominator"] = json!(outcomes.values().sum::<usize>());
+    let covered = ["ok", "forced", "structural_ok"]
+        .iter()
+        .filter_map(|k| outcomes.get(k))
+        .sum::<usize>();
+    ending["coverage"] = json!(
+        ending["denominator"]
+            .as_u64()
+            .filter(|n| *n != 0)
+            .map(|n| covered as f64 / n as f64)
+    );
     report.runs.push(ending);
     Ok(())
 }
@@ -748,6 +844,9 @@ fn summarize(report: Report, weighted: bool) -> Value {
         "recovered_after_historical_power_gate":report.recovered_after_historical_power_gate,
         "parity_checks":report.checks,"different_policy_fields":report.token_diff,
         "positions_by_act":report.positions_by_act,"positions_by_room":report.positions_by_room,
+        "outcomes_by_act":report.outcomes_by_act,"outcomes_by_room":report.outcomes_by_room,
+        "outcomes_by_encounter":report.outcomes_by_encounter,"outcomes_by_relic":report.outcomes_by_relic,
+        "relic_counter_diffs":report.relic_counter_diffs,
         "oracle_card_variable_shapes":report.private_card_variables,
         "simulator_importer_warnings":report.importer_warnings,
         "first_failure_by_encounter":report.first_failure_by_encounter,
@@ -887,12 +986,109 @@ enum Sampling<'a> {
     Instinct(&'a E2eNet),
 }
 
-const HELD_OUT_FIRST_SEED: i64 = 182_003_700;
+pub fn uncertainty_poc(net: &E2eNet) -> Result<Value> {
+    use sts2_core::{Relic, RelicId};
 
-pub fn held_out(net: &E2eNet, runs: u8, steps: usize) -> Result<Value> {
+    let _scope = Scope::enter(model::BUILD);
+    let mut outcomes = BTreeMap::<_, usize>::new();
+    let cases = ["CORPSE_SLUGS_NORMAL", "NIBBITS_WEAK", "BYGONE_EFFIGY_ELITE"];
+    let variants = [(RelicId::RuinedHelmet, 0), (RelicId::RuinedHelmet, 1)];
+    let mut forwards = 0;
+    for (index, encounter) in cases.into_iter().enumerate() {
+        let seed = FIRST_SEED + index as i64;
+        let mut original = targeted_run(encounter, seed)?;
+        let mut driver = Driver::new(seed);
+        for step in 0..16 {
+            let next = driver.peek(&mut original);
+            let Some(cs) = &original.combat else { break };
+            if matches!(&next, Next::Decision(d) if d.is_combat())
+                && emit::pending_choice(cs).is_none()
+            {
+                let result = (|| {
+                    let raw = sim_observation::combat(&original, &emit::legal_actions(cs))?;
+                    let obs = observation::sanitize_live(&raw, Context::Combat)?;
+                    let base = engine::reconstruct(&obs)?;
+                    let mut rows = Vec::with_capacity(variants.len());
+                    for (id, counter) in variants {
+                        // The public fixture declares the same equipped relic in
+                        // both worlds, with no public witness of its activation.
+                        // The exhaustive two-value domain comes from the rules,
+                        // never from the source combat's native hidden values.
+                        let mut world = base.clone();
+                        world.run_state.relics.push(id);
+                        let combat = world.combat.as_mut().expect("reconstructed combat");
+                        combat.relics.push(Relic {
+                            id: combat
+                                .relics
+                                .iter()
+                                .map(|r| r.id)
+                                .max()
+                                .unwrap()
+                                .checked_add(1)
+                                .expect("fixture relic ID"),
+                            kind: id.to_relic_kind().expect("combat relic"),
+                            counter,
+                            is_melted: false,
+                            is_wax: false,
+                        });
+                        let (actions, _) = engine::checked_actions(&obs, &world)?;
+                        let decision = engine::checked_decision(&obs, &mut world, &actions)?;
+                        let row = model::observed_combat_row(net, &decision, &world)?;
+                        let logits = net
+                            .try_logits(&row)
+                            .map_err(|e| mismatch("inference", &e))?;
+                        model::validate_logits(decision.members.len(), &logits)?;
+                        forwards += 1;
+                        rows.push((actions, decision.classes, decision.members, row, logits));
+                    }
+                    Ok::<_, Failure>(rows)
+                })();
+                match result {
+                    Ok(rows) if rows[0] == rows[1] => {
+                        *outcomes.entry("equivalent").or_default() += 1;
+                    }
+                    Ok(rows) => {
+                        *outcomes.entry("different").or_default() += 1;
+                        for (different, label) in [
+                            (rows[0].0 != rows[1].0, "legal_actions_and_targets"),
+                            (rows[0].1 != rows[1].1 || rows[0].2 != rows[1].2, "classes"),
+                            (rows[0].3 != rows[1].3, "tokens"),
+                            (rows[0].4 != rows[1].4, "logits"),
+                        ] {
+                            if different {
+                                *outcomes.entry(label).or_default() += 1;
+                            }
+                        }
+                    }
+                    Err(err) => *outcomes.entry(err.code).or_default() += 1,
+                }
+            }
+            let (action, kind) = match next {
+                Next::Decision(d) => d
+                    .member_action(choose(&d, step, seed))
+                    .map_err(|e| mismatch("sim_generation", &e))?,
+                Next::Forced(f) => (f.action, f.kind),
+                Next::Terminal(_) => break,
+            };
+            driver
+                .apply(&mut original, &action, kind)
+                .map_err(|e| mismatch("sim_generation", &e))?;
+        }
+    }
+    Ok(
+        json!({"schema_version":1,"source":"configured_simulator_fights","scope":"Ruined Helmet only",
+        "variant_domain":[0,1],"max_positions":48,"max_forwards":96,"forwards":forwards,"results":outcomes,
+        "model":model::pin()}),
+    )
+}
+
+const REGRESSION_FIRST_SEED: i64 = 182_003_700;
+
+pub fn held_out(net: &E2eNet, runs: u8, steps: usize, first_seed: Option<i64>) -> Result<Value> {
     let _scope = Scope::enter(model::BUILD);
     let mut campaign = Report::default();
-    for seed in HELD_OUT_FIRST_SEED..HELD_OUT_FIRST_SEED + i64::from(runs) {
+    let first_seed = first_seed.unwrap_or(REGRESSION_FIRST_SEED);
+    for seed in first_seed..first_seed + i64::from(runs) {
         walk(
             &mut campaign,
             new_run_at(seed, 0),
@@ -905,7 +1101,7 @@ pub fn held_out(net: &E2eNet, runs: u8, steps: usize) -> Result<Value> {
     Ok(
         json!({"schema_version":1,"upstream_revision":model::REVISION,"engine_build":model::BUILD.as_str(),
         "model":model::pin(),"sampling_policy":model::OBSERVATION,"evaluation_policy":model::OBSERVED_COMBAT,
-        "first_seed":HELD_OUT_FIRST_SEED,"held_out":summarize(campaign,true)}),
+        "first_seed":first_seed,"held_out":summarize(campaign,true)}),
     )
 }
 

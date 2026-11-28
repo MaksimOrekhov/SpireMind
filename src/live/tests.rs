@@ -333,6 +333,211 @@ fn live_and_replay_do_not_use_private_relic_latches() {
     assert_eq!(after.board["run_state"]["relics"][1]["counter"], 4);
 }
 
+fn relic_witness_cases() -> [(&'static str, &'static str, Value, Value, i32); 6] {
+    [
+        (
+            "VAMBRACE",
+            "observer_relic_status",
+            json!("active"),
+            json!("normal"),
+            1,
+        ),
+        (
+            "UNSETTLING_LAMP",
+            "observer_relic_status",
+            json!("active"),
+            json!("normal"),
+            2,
+        ),
+        (
+            "THROWING_AXE",
+            "observer_relic_status",
+            json!("active"),
+            json!("normal"),
+            1,
+        ),
+        (
+            "LIZARD_TAIL",
+            "observer_relic_status",
+            json!("normal"),
+            json!("disabled"),
+            1,
+        ),
+        (
+            "PERMAFROST",
+            "observer_trigger_seen",
+            json!(false),
+            json!(true),
+            1,
+        ),
+        (
+            "CENTENNIAL_PUZZLE",
+            "observer_trigger_seen",
+            json!(false),
+            json!(true),
+            1,
+        ),
+    ]
+}
+
+#[test]
+fn live_relic_transitions_depend_only_on_current_public_witness() {
+    let _scope = sts2_e2e::build::Scope::enter(model::BUILD);
+    for (id, field, ready, spent, spent_counter) in relic_witness_cases() {
+        let mut raw = base(Context::Combat);
+        let mut relic = json!({"id":id, "counter":999, "status":"normal"});
+        relic[field] = ready.clone();
+        raw["run_state"]["relics"] = json!([relic]);
+        assert!(
+            observation::sanitize_live(&raw, Context::Combat).is_err(),
+            "{id}"
+        );
+        raw["capabilities"]["spiremind_relic_witness"] = json!(1);
+        for (index, (witness, expected)) in [(ready.clone(), 0), (spent, spent_counter), (ready, 0)]
+            .into_iter()
+            .enumerate()
+        {
+            if id == "LIZARD_TAIL" && index == 2 {
+                break;
+            }
+            raw["state_id"] = json!(index + 1);
+            raw["run_state"]["relics"][0][field] = witness;
+            let mut reconnected = Session::new(index as u64 + 10);
+            let position = pos(reconnected.accept(&raw).unwrap());
+            let obs = reconnected.observe(&raw, position).unwrap();
+            assert!(obs.board["run_state"]["relics"][0].get("counter").is_none());
+            assert_eq!(
+                obs.board,
+                sanitize(&obs.board, Context::Combat).unwrap().board
+            );
+            let rebuilt = engine::reconstruct(&obs).unwrap().combat.unwrap();
+            assert_eq!(
+                rebuilt.relics.iter().next().unwrap().counter,
+                expected,
+                "{id}"
+            );
+        }
+        raw["run_state"]["relics"][0][field] = Value::Null;
+        assert!(
+            observation::sanitize_live(&raw, Context::Combat).is_err(),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Instinct weights"]
+fn model_smoke_public_relic_witness_parity() {
+    use sts2_e2e::build::Scope;
+    use sts2_wire::emit;
+    let _scope = Scope::enter(model::BUILD);
+    let net = model::load(&model::default_weights()).unwrap();
+    for (id, field, ready, spent, used) in relic_witness_cases() {
+        for (public, counter) in [(ready, 0), (spent, used)] {
+            let mut raw = base(Context::Combat);
+            let mut relic = json!({"id":id, "counter":999});
+            relic[field] = public;
+            raw["capabilities"]["spiremind_relic_witness"] = json!(1);
+            raw["run_state"]["relics"] = json!([relic]);
+            let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+            let mut state = engine::reconstruct(&obs).unwrap();
+            let actions = emit::legal_actions(state.combat.as_ref().unwrap());
+            let mut oracle = state.clone();
+            oracle
+                .combat
+                .as_mut()
+                .unwrap()
+                .relics
+                .iter_mut()
+                .next()
+                .unwrap()
+                .counter = counter;
+            assert_eq!(
+                actions,
+                emit::legal_actions(oracle.combat.as_ref().unwrap())
+            );
+            let actual = engine::checked_decision(&obs, &mut state, &actions).unwrap();
+            let expected = engine::checked_decision(&obs, &mut oracle, &actions).unwrap();
+            assert_eq!(actual.classes, expected.classes, "{id}");
+            assert_eq!(actual.members, expected.members, "{id}");
+            let a = model::observed_combat_row(&net, &actual, &state).unwrap();
+            let b = model::observed_combat_row(&net, &expected, &oracle).unwrap();
+            assert!(a == b, "{id}");
+            assert_eq!(
+                net.try_logits(&a).unwrap(),
+                net.try_logits(&b).unwrap(),
+                "{id}"
+            );
+        }
+    }
+}
+
+#[test]
+fn sword_of_stone_counter_has_same_polarity_in_run_and_combat() {
+    let _scope = sts2_e2e::build::Scope::enter(model::BUILD);
+    let mut raw = base(Context::Combat);
+    raw["run_state"]["relics"] = json!([{"id":"SWORD_OF_STONE","counter":2}]);
+    let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+    let state = engine::reconstruct(&obs).unwrap();
+    assert_eq!(
+        state.run_state.relic_counters[&sts2_core::RelicId::SwordOfStone],
+        3
+    );
+    assert_eq!(
+        state.combat.unwrap().relics.iter().next().unwrap().counter,
+        3
+    );
+    for context in [Context::CardReward, Context::Map] {
+        let mut raw = base(context);
+        raw["run_state"]["relics"] = json!([{"id":"SWORD_OF_STONE","counter":2}]);
+        let obs = observation::sanitize_live(&raw, context).unwrap();
+        let state = engine::reconstruct(&obs).unwrap();
+        assert_eq!(
+            state.run_state.relic_counters[&sts2_core::RelicId::SwordOfStone],
+            3
+        );
+    }
+}
+
+#[test]
+fn imbalanced_accepts_only_rock_and_derives_dizzy_from_current_stun() {
+    let _scope = sts2_e2e::build::Scope::enter(model::BUILD);
+    let mut raw = base(Context::Combat);
+    raw["enemies"][0]["powers"] = json!([{"id":"IMBALANCED","name":"Imbalanced","amount":1,
+        "display_amount":1,"observer_visible":true}]);
+    assert!(observation::sanitize_live(&raw, Context::Combat).is_err());
+    for id in ["BOWLBUG_ROCK", "BowlbugRock"] {
+        raw["enemies"][0]["id"] = json!(id);
+        raw["enemies"][0]["intents"] = json!([{"kind":"StunIntent","intent_type":"Stun"}]);
+        let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+        let (wire, warnings) = engine::combat_wire(&obs.board, 0).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(wire["encounter"][0]["move_state"], "DIZZY");
+    }
+}
+
+#[test]
+fn live_power_tooltip_requires_explicit_public_provenance() {
+    let mut raw = base(Context::Combat);
+    raw["player"]["powers"] = json!([
+        {"id":"CRIMSON_MANTLE","name":"Crimson Mantle","amount":17,"display_amount":17,
+         "observer_visible":true,"vars":{"SelfDamage":99}},
+        {"id":"SELF_FORMING_CLAY","name":"Self-Forming Clay","amount":6,"display_amount":6,"observer_visible":true},
+        {"id":"PYRE","name":"Pyre","amount":2,"display_amount":2,"observer_visible":true},
+        {"id":"FREE_ATTACK","name":"Free Attack","amount":2,"display_amount":2,"observer_visible":true}
+    ]);
+    assert!(observation::sanitize_live(&raw, Context::Combat).is_err());
+    raw["player"]["powers"][0]["observer_self_damage"] = json!(2);
+    assert!(observation::sanitize_live(&raw, Context::Combat).is_err());
+    raw["capabilities"]["spiremind_power_tooltip"] = json!(1);
+    let obs = observation::sanitize_live(&raw, Context::Combat).unwrap();
+    assert!(obs.board["player"]["powers"][0].get("vars").is_none());
+    let _scope = sts2_e2e::build::Scope::enter(model::BUILD);
+    let (wire, warnings) = engine::combat_wire(&obs.board, 0).unwrap();
+    assert!(warnings.is_empty());
+    assert_eq!(wire["player"]["powers"][0]["counter"], 2);
+}
+
 #[test]
 fn targeted_potion_requires_current_observed_legal_enemy_indices() {
     let mut raw = base(Context::Combat);
