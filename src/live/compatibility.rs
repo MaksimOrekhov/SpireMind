@@ -12,6 +12,7 @@ use sts2_e2e::{
 use sts2_wire::emit;
 
 use super::{
+    advisor_experiment::Experiment,
     engine, observation,
     powers::{self, Owner},
     sim_observation,
@@ -696,6 +697,7 @@ fn walk(
     seed: i64,
     steps: usize,
     sampling: Sampling,
+    mut experiment: Option<&mut Experiment>,
 ) -> Result<()> {
     let mut driver = Driver::new(seed);
     let mut cache = TokCache::new();
@@ -719,6 +721,9 @@ fn walk(
         {
             let actions = emit::legal_actions(cs);
             if let Some(outcome) = report.evaluate(&rm, &actions, net) {
+                if let (Some(exp), Some(net)) = (experiment.as_deref_mut(), net) {
+                    exp.evaluate(&rm, &actions, net);
+                }
                 let record = |by: &mut Breakdown, id: String| {
                     *by.entry(id).or_default().entry(outcome).or_default() += 1;
                 };
@@ -761,6 +766,9 @@ fn walk(
                 break;
             }
         };
+        if let Some(exp) = experiment.as_deref_mut() {
+            exp.on_action(&rm, &action, kind);
+        }
         driver
             .apply(&mut rm, &action, kind)
             .map_err(|e| mismatch("sim_generation", &e))?;
@@ -814,6 +822,54 @@ mod tests {
         assert_eq!(report.semantic_positions, 2);
         assert_eq!(report.public_collisions, 1);
         assert_eq!(report.duplicates, 1);
+    }
+
+    #[test]
+    #[ignore = "requires the pinned Instinct weights"]
+    fn architecture_model_smoke_uses_native_advice_and_masks_candidate() {
+        let _scope = Scope::enter(model::BUILD);
+        let weights = model::default_weights();
+        let net = model::load(&weights).unwrap();
+        let mut strict = Report::default();
+        let mut experiment = Experiment::new(&weights);
+        let rm = targeted_run("NIBBITS_WEAK", FIRST_SEED).unwrap();
+        walk(
+            &mut strict,
+            rm,
+            Some(&net),
+            FIRST_SEED,
+            20,
+            Sampling::ConfiguredFight,
+            Some(&mut experiment),
+        )
+        .unwrap();
+        let strict = summarize(strict, true);
+        let result = experiment.export();
+        assert_eq!(result["stock"]["denominator"], strict["denominator"]);
+        assert_eq!(result["candidate"]["denominator"], strict["denominator"]);
+        assert_eq!(
+            result["candidate_wire_roundtrip"]["denominator"],
+            strict["denominator"]
+        );
+        assert!(
+            result["stock_checks"]["instinct_response"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(
+            result["stock"]["outcomes"]["ok"].as_u64().unwrap_or(0) > 0,
+            "{result}"
+        );
+        assert!(result["candidate"]["outcomes"]["ok"].as_u64().unwrap_or(0) > 0);
+        assert!(
+            result["candidate_hidden_redeal"]["identical"]
+                .as_u64()
+                .unwrap_or(0)
+                > 0
+        );
+        assert!(result["candidate_hidden_redeal"]["different"].is_null());
+        assert_eq!(result["stock_mirror"]["searched_selects"], 0);
     }
 }
 
@@ -1084,6 +1140,110 @@ pub fn uncertainty_poc(net: &E2eNet) -> Result<Value> {
 
 const REGRESSION_FIRST_SEED: i64 = 182_003_700;
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+pub enum ArchitecturePanel {
+    Development,
+    Regression,
+    Expanded,
+    Validation,
+}
+
+pub fn architecture(
+    net: &E2eNet,
+    weights: &std::path::Path,
+    panel: ArchitecturePanel,
+    new_first_seed: Option<i64>,
+) -> Result<Value> {
+    let _scope = Scope::enter(model::BUILD);
+    let (name, first, runs, steps, sampling, expected) = match panel {
+        ArchitecturePanel::Development => (
+            "development",
+            FIRST_SEED,
+            8,
+            180,
+            Sampling::Development,
+            Some(701),
+        ),
+        ArchitecturePanel::Regression => (
+            "regression",
+            REGRESSION_FIRST_SEED,
+            4,
+            1500,
+            Sampling::Instinct(net),
+            Some(2269),
+        ),
+        ArchitecturePanel::Expanded => (
+            "expanded",
+            754_255_491,
+            8,
+            1500,
+            Sampling::Instinct(net),
+            Some(4333),
+        ),
+        ArchitecturePanel::Validation => {
+            let first = new_first_seed.ok_or_else(|| {
+                mismatch(
+                    "architecture_seed",
+                    "Validation panel requires --first-seed",
+                )
+            })?;
+            if [
+                FIRST_SEED..FIRST_SEED + 8,
+                REGRESSION_FIRST_SEED..REGRESSION_FIRST_SEED + 4,
+                754_255_491..754_255_499,
+            ]
+            .into_iter()
+            .any(|known| first < known.end && first + 8 > known.start)
+            {
+                return Err(mismatch(
+                    "architecture_seed",
+                    "Validation seeds overlap a frozen panel",
+                ));
+            }
+            ("validation", first, 8, 1500, Sampling::Instinct(net), None)
+        }
+    };
+    let mut strict = Report::default();
+    let mut comparison = Experiment::new(weights);
+    for seed in first..first + runs {
+        comparison.run_boundary();
+        walk(
+            &mut strict,
+            new_run_at(seed, 0),
+            Some(net),
+            seed,
+            steps,
+            sampling,
+            Some(&mut comparison),
+        )?;
+    }
+    let strict = summarize(strict, true);
+    let comparison = comparison.export();
+    let denominator = strict["denominator"].as_u64();
+    for n in [
+        expected,
+        comparison["stock"]["denominator"].as_u64(),
+        comparison["candidate"]["denominator"].as_u64(),
+        comparison["candidate_wire_roundtrip"]["denominator"].as_u64(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if denominator != Some(n) {
+            return Err(mismatch(
+                "architecture_cohort",
+                "Architecture denominators differ from the frozen panel",
+            ));
+        }
+    }
+    Ok(
+        json!({"schema_version":1,"source":"simulator_derived", "panel":name, "first_seed":first,
+        "upstream_revision":model::REVISION,"engine_build":model::BUILD.as_str(),"model":model::pin(),
+        "search_fallback":false,"production_data_policy_changed":false,
+        "strict":strict,"comparison":comparison}),
+    )
+}
+
 pub fn held_out(net: &E2eNet, runs: u8, steps: usize, first_seed: Option<i64>) -> Result<Value> {
     let _scope = Scope::enter(model::BUILD);
     let mut campaign = Report::default();
@@ -1096,6 +1256,7 @@ pub fn held_out(net: &E2eNet, runs: u8, steps: usize, first_seed: Option<i64>) -
             seed,
             steps,
             Sampling::Instinct(net),
+            None,
         )?;
     }
     Ok(
@@ -1116,6 +1277,7 @@ pub fn run(net: Option<&E2eNet>, runs: u8, steps: usize) -> Result<Value> {
             seed,
             steps,
             Sampling::Development,
+            None,
         )?;
     }
     let mut targeted = BTreeMap::new();
@@ -1132,6 +1294,7 @@ pub fn run(net: Option<&E2eNet>, runs: u8, steps: usize) -> Result<Value> {
             seed,
             40,
             Sampling::ConfiguredFight,
+            None,
         )?;
         targeted.insert(encounter, summarize(report, net.is_some()));
     }

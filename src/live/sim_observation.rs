@@ -189,9 +189,14 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
     // Upstream belief view removes the unknown draw order and redeals RNG.
     // Only an explicit public projection of its wire leaves this function.
     let cs = snapshot::belief_view(cs);
-    let wire =
-        snapshot::state_dict(&cs).map_err(|_| projection("Simulator state export failed"))?;
-    let telegraphs = emit::combat::enemy_telegraphs(&cs)
+    combat_from(rm, &cs, actions)
+}
+
+// Also used by the explicitly offline stock-Advisor benchmark with the
+// simulator's actual pile order. The strict public entry point is above.
+pub(super) fn combat_from(rm: &RunManager, cs: &CombatState, actions: &Value) -> Result<Value> {
+    let wire = snapshot::state_dict(cs).map_err(|_| projection("Simulator state export failed"))?;
+    let telegraphs = emit::combat::enemy_telegraphs(cs)
         .map_err(|_| projection("Simulator telegraph export failed"))?;
     let run = &rm.run_state;
     let player = &wire["player"];
@@ -371,7 +376,7 @@ pub(super) fn combat(rm: &RunManager, actions: &Value) -> Result<Value> {
         for (i, (&uid, w)) in uids.iter().zip(source).enumerate() {
             let c =
                 card_by_uid(&cs.cards, uid).ok_or_else(|| projection("Missing card instance"))?;
-            let mut value = combat_card(&cs, c, w);
+            let mut value = combat_card(cs, c, w);
             if wire_key == "hand" {
                 let plays: Vec<_> = rows(actions)
                     .iter()

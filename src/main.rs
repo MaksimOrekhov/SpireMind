@@ -83,6 +83,14 @@ enum Mode {
         #[arg(long, value_parser = clap::value_parser!(i64).range(0..i64::MAX - 16))]
         first_seed: Option<i64>,
     },
+    /// Compare the three combat advisor architectures offline on a frozen cohort.
+    Architecture {
+        #[arg(value_enum)]
+        panel: live::compatibility::ArchitecturePanel,
+        /// First of eight new seeds, required for the validation panel.
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..simulation::SEED_LIMIT - 8))]
+        first_seed: Option<i64>,
+    },
     /// List observation compatibility for the pinned upstream power registry.
     PowerMatrix,
     /// Compare both possible Ruined Helmet latch values in bounded offline fixtures.
@@ -152,6 +160,7 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             | Mode::Benchmark { .. }
             | Mode::Compatibility { .. }
             | Mode::HeldOut { .. }
+            | Mode::Architecture { .. }
             | Mode::UncertaintyPoc
     ) {
         model::check_build(cli.game_version.as_deref().unwrap_or(BUILD.as_str()))?;
@@ -159,6 +168,10 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
     let path = cli.weights.unwrap_or_else(model::default_weights);
     let net = model::load(&path)?;
     match cli.command {
+        Mode::Architecture { panel, first_seed } => Ok((
+            live::compatibility::architecture(&net, &path, panel, first_seed)?,
+            true,
+        )),
         Mode::UncertaintyPoc => Ok((live::compatibility::uncertainty_poc(&net)?, true)),
         Mode::Recommend {
             context,

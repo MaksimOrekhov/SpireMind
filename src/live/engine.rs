@@ -27,7 +27,7 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Action {
+pub(super) enum Action {
     Play(u64, Option<u64>),
     Potion(u64, Option<u64>),
     EndTurn,
@@ -36,7 +36,7 @@ enum Action {
 }
 
 impl Action {
-    fn from_engine(value: &Value) -> Result<Self> {
+    pub(super) fn from_engine(value: &Value) -> Result<Self> {
         let index = |field| number(value, field, 255);
         let optional = |field: &str| {
             if value.get(field) == Some(&Value::Null) {

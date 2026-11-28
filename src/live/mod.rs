@@ -1,3 +1,4 @@
+mod advisor_experiment;
 pub(crate) mod compatibility;
 mod diagnostics;
 mod engine;
