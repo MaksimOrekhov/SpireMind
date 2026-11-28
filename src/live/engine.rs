@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
-use sts2_advisor::{board, combat_mirror, graft, instinct_combat, instinct_screens};
+use sts2_advisor::{
+    board, board_targets::BoardTargets, combat_mirror, graft, instinct_combat, instinct_screens,
+};
 use sts2_content::monster_dispatch::build_ai_for_version;
 use sts2_core::{
     Card, CreatureUid, RelicId, card_by_uid,
@@ -118,9 +120,13 @@ fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action,
                 .combat
                 .as_ref()
                 .ok_or_else(|| rebuild("Combat state missing after graft"))?;
-            if cs.player.hand.len() != hand.len()
-                || cs.enemy_uids.len() != list(b, "enemies", 32)?.len()
-            {
+            let mapping = BoardTargets::of(cs);
+            let enemies = list(b, "enemies", 32)?;
+            let native = b.get("native_current").is_some();
+            let slots = (0..cs.enemy_uids.len())
+                .filter(|&index| !native || mapping.to_board(index as i64).is_some())
+                .collect::<Vec<_>>();
+            if cs.player.hand.len() != hand.len() || slots.len() != enemies.len() {
                 return Err(coverage(
                     "Hand or enemy indexes changed during reconstruction",
                 ));
@@ -139,11 +145,16 @@ fn screen_actions(obs: &Observation, rm: &RunManager) -> Result<BTreeMap<Action,
                 }
                 if boolean(card, "playable")? {
                     for target in targets(b, card)? {
-                        actions.insert(Action::Play(i as u64,target),json!({"kind":"play","card":{"hand_index":i,"id":card["id"],"name":card["name"],"effective_cost":card["effective_cost"],"upgrade_level":card["upgrade_level"],"enchantment":card["enchantment"],"affliction":card["affliction"]},"target":enemy_detail(b,target)}));
+                        let mut detail = json!({"kind":"play","card":{"hand_index":i,"id":card["id"],"name":card["name"],"effective_cost":card["effective_cost"],"upgrade_level":card["upgrade_level"],"enchantment":card["enchantment"],"affliction":card["affliction"]},"target":enemy_detail(b,target)});
+                        if native {
+                            detail["card"]["instance_id"] = card["instance_id"].clone();
+                        }
+                        actions.insert(Action::Play(i as u64, target), detail);
                     }
                 }
             }
-            for (e, uid) in list(b, "enemies", 32)?.iter().zip(&cs.enemy_uids) {
+            for (e, index) in enemies.iter().zip(slots) {
+                let uid = cs.enemy_uids[index];
                 let enemy = creature_by_id(&cs.creatures, uid.0)
                     .ok_or_else(|| rebuild("Enemy missing after graft"))?;
                 if instinct_screens::norm_id(&e["id"])
@@ -295,7 +306,7 @@ fn matches_telegraph(actual: &[Value], rebuilt: &[Value]) -> bool {
         })
 }
 
-fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
+pub(super) fn check_telegraphs(b: &Value, rm: &mut RunManager, repair: bool) -> Result<()> {
     let ascension = rm.ascension_level;
     let cs = rm
         .combat
@@ -327,7 +338,8 @@ fn check_telegraphs(b: &Value, rm: &mut RunManager) -> Result<()> {
             continue;
         }
         let missing = || rebuild("A visible intent or its shown damage could not be reconstructed");
-        if actual.len() < 2
+        if !repair
+            || actual.len() < 2
             || !rebuilt
                 .first()
                 .is_some_and(|head| matches_telegraph(&actual[..1], std::slice::from_ref(head)))
@@ -413,16 +425,7 @@ pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<S
                 }
             }
         }
-        relics.retain(|r| {
-            let kind = r["id"].as_str().and_then(|id| {
-                sts2_content::names::relic_id_from_str_any_build(
-                    id.strip_prefix("RELIC.").unwrap_or(id),
-                )
-            });
-            !matches!(kind, Some(RelicId::NeowsSacrifice | RelicId::DowsingRod))
-                || r["is_wax"] == true
-                || r["is_melted"] == true
-        });
+        remove_pickup_only_relics(relics);
     }
     for power in board["player"]["powers"]
         .as_array_mut()
@@ -465,6 +468,16 @@ pub(super) fn combat_wire(public: &Value, ascension: u8) -> Result<(Value, Vec<S
     }
     board::combat_wire(&board, Some("Ironclad"), i64::from(ascension), 0, 0)
         .map_err(|_| rebuild("Upstream could not translate the combat board"))
+}
+
+pub(super) fn remove_pickup_only_relics(relics: &mut Vec<Value>) {
+    relics.retain(|r| {
+        !matches!(
+            super::relics::id(r),
+            Some(RelicId::NeowsSacrifice | RelicId::DowsingRod)
+        ) || r["is_wax"] == true
+            || r["is_melted"] == true
+    });
 }
 
 pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
@@ -510,6 +523,9 @@ pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
         ));
     }
     match obs.context {
+        Context::Combat if board.get("native_current").is_some() => {
+            super::native_current::reconstruct(&board, &mut rm)?;
+        }
         Context::Combat => {
             let (wire, warnings) = combat_wire(&board, rm.ascension_level)?;
             if !warnings.is_empty() {
@@ -530,7 +546,7 @@ pub(super) fn reconstruct(obs: &Observation) -> Result<RunManager> {
             {
                 return Err(rebuild("The observed encounter is unsupported"));
             }
-            check_telegraphs(&board, &mut rm)?;
+            check_telegraphs(&board, &mut rm, true)?;
         }
         Context::CardReward => {
             let room = graft::live_room(&board)
@@ -591,9 +607,22 @@ pub(super) fn checked_actions(obs: &Observation, rm: &RunManager) -> Result<(Val
     let rows = engine
         .as_array()
         .ok_or_else(|| coverage("Expected engine action array"))?;
+    let targets = rm.combat.as_ref().map(BoardTargets::of);
     let keys = rows
         .iter()
-        .map(Action::from_engine)
+        .map(|row| {
+            if obs.board.get("native_current").is_some() {
+                let board_action = targets
+                    .as_ref()
+                    .and_then(|t| t.board_action(row))
+                    .ok_or_else(|| {
+                        coverage("A native action targets an enemy absent from the game board")
+                    })?;
+                Action::from_engine(&board_action)
+            } else {
+                Action::from_engine(row)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     let set = keys.iter().copied().collect::<BTreeSet<_>>();
     if rows.is_empty() || set.len() != rows.len() || !set.iter().copied().eq(screen.keys().copied())

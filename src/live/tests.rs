@@ -6,7 +6,7 @@ use std::{
 };
 
 use super::{
-    Latest, Live, Terminal, engine,
+    Latest, Live, Terminal, engine, native_current,
     observation::{self, sanitize},
     session::{Ack, Event, Position, Session},
     transport::{Frames, MAX_FRAME, Receive},
@@ -119,6 +119,135 @@ fn synthetic_projection_is_invariant_to_hidden_order_rng_and_forecasts() {
     assert!(!clean.to_string().contains("secret"));
     assert!(clean.get("rng").is_none() && clean.get("seed").is_none());
     assert_eq!(clean, sanitize(&clean, Context::Combat).unwrap().board);
+}
+
+fn native_board() -> Value {
+    let mut b = base(Context::Combat);
+    b["native_current"] = json!(1);
+    b["capabilities"]["spiremind_native_current"] = json!(1);
+    // The live producer removes ordinary corpses from CombatState.Enemies.
+    b["enemies"].as_array_mut().unwrap().remove(1);
+    for (i, card) in b["hand"].as_array_mut().unwrap().iter_mut().enumerate() {
+        card["valid_target_indices"] = json!([0, 1]);
+        card["instance_id"] = json!(100 + i);
+    }
+    b
+}
+
+fn change_native_future(b: &mut Value, axis: usize) {
+    match axis {
+        0 => {
+            b["seed"] = json!("hidden seed");
+            b["rng"] = json!({"run_seed":-8668, "counters":{"shuffle":55,"monster_ai":3}});
+            b["coop_rng"] = json!("coop rng");
+            b["player"]["rng"] = json!(95);
+            b["map"]["encounter_queue"] = json!(["hidden"]);
+            b["run_state"]["future_rewards"] = json!(["hidden"]);
+        }
+        1 => {
+            b["draw_pile"]["cards"].as_array_mut().unwrap().reverse();
+            b["draw_pile"]["cards"][0]["uid"] = json!(99);
+            b["draw_pile"]["cards"][1]["stable_idx"] = json!(99);
+            b["draw_pile"]["pinned_top"] = json!([42]);
+            b["draw_pile"]["known_order"] = json!([1, 0]);
+        }
+        2 => {
+            b["enemies"][0]["ai"] = json!({"forced_next":"SECRET","log":["SECRET"],"future":[1]});
+            b["enemies"][0]["completed_move_flags"]["forced_next"] = json!("SECRET");
+            b["enemies"][0]["forecast"] = json!(["SECRET"]);
+            b["enemies"][0]["intents"][0]["forecast"] = json!("SECRET");
+            b["cached_combat"] = json!({"rng":3,"future_intent":"SECRET"});
+            b["hand"][0]["combat_vars"]["some_future_result"] = json!(4);
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn native_current_schema_and_session_require_the_current_contract() {
+    let mut raw = native_board();
+    raw["enemies"][0]["completed_move_flags"] = json!({"performed":true});
+    raw["hand"][0]["combat_vars"] = json!({"return_if_played_round":2});
+    let accepted = native_current::sanitize(&raw).unwrap().board;
+    for axis in 0..3 {
+        let mut dirty = raw.clone();
+        change_native_future(&mut dirty, axis);
+        assert_eq!(accepted, native_current::sanitize(&dirty).unwrap().board);
+    }
+    assert_eq!(native_current::sanitize(&accepted).unwrap().board, accepted);
+    let mut session = Session::new(5);
+    let Event::Observation(p) = session.accept(&raw).unwrap() else {
+        panic!("expected advice frame");
+    };
+    assert_eq!(session.observe_native(&raw, p).unwrap().board, accepted);
+    raw["native_current"] = json!(2);
+    assert_eq!(
+        session.observe_native(&raw, p).err().unwrap().code,
+        "native_current_version"
+    );
+    raw["native_current"] = json!(1);
+    raw["enemies"][1]["combat_id"] = raw["enemies"][0]["combat_id"].clone();
+    assert!(session.observe_native(&raw, p).is_err());
+    raw["enemies"][1]["combat_id"] = json!(93);
+    raw["run_state"]["relics"] = json!([{"id":"LIZARD_TAIL", "status":"normal"}]);
+    assert_eq!(
+        session.observe_native(&raw, p).err().unwrap().code,
+        "native_current_relic_counter"
+    );
+}
+
+#[test]
+#[ignore = "requires official Instinct weights"]
+fn native_current_model_smoke_actions_tokens_and_logits_ignore_each_future_source() {
+    use sts2_e2e::build::Scope;
+    let _scope = Scope::enter(model::BUILD);
+    let net = model::load(&model::default_weights()).unwrap();
+    let mut raw = native_board();
+    raw["enemies"][0]["completed_move_flags"] = json!({"performed":false});
+    raw["hand"][0]["combat_vars"] = json!({});
+    let infer = |board: &Value| {
+        let roundtrip = serde_json::from_str(&board.to_string()).unwrap();
+        let obs = native_current::sanitize(&roundtrip).unwrap();
+        let mut rm = engine::reconstruct(&obs).unwrap();
+        let (rows, actions) = engine::checked_actions(&obs, &rm).unwrap();
+        let d = engine::checked_decision(&obs, &mut rm, &rows).unwrap();
+        let tokens = model::observed_combat_row(&net, &d, &rm).unwrap();
+        let (logits, ms) = model::forward(&net, &d, &tokens).unwrap();
+        assert!(ms > 0.0);
+        (actions, d.classes, d.members, tokens, logits)
+    };
+    let expected = infer(&raw);
+    assert_eq!(expected.0.len(), 5);
+    assert!(
+        expected
+            .0
+            .iter()
+            .any(|a| a["action"]["target"]["combat_id"] == 93)
+    );
+    assert!(
+        !expected
+            .0
+            .iter()
+            .any(|a| a["action"]["target"]["combat_id"] == 92)
+    );
+    for axis in 0..3 {
+        let mut dirty = raw.clone();
+        change_native_future(&mut dirty, axis);
+        assert!(
+            expected == infer(&dirty),
+            "future axis {axis} changed advice"
+        );
+    }
+    let obs = native_current::sanitize(&raw).unwrap();
+    let result = engine::advise(&net, &obs).unwrap();
+    assert_eq!(result["status"], "ok");
+    assert_eq!(result["legal_actions"], json!(expected.0));
+    raw["hand"][0]["valid_target_indices"] = json!([0]);
+    let obs = native_current::sanitize(&raw).unwrap();
+    assert_eq!(
+        engine::advise(&net, &obs).unwrap_err().code,
+        "action_coverage"
+    );
 }
 
 #[test]
@@ -848,7 +977,8 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
             Ok(())
         }
     }
-    let live = Live {
+    let mut live = Live {
+        native_current: false,
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
         blocked_corpus: Mutex::new(None),
@@ -910,11 +1040,38 @@ fn synthetic_transport_writes_only_advice_ack_and_refuses_autopilot() {
     );
     let latest = live.latest.lock().unwrap();
     assert!(latest.position.is_none() && latest.pending.is_none() && !latest.confirmed);
+    drop(latest);
+    let native = native_board();
+    duplex.output.clear();
+    duplex.input = Cursor::new(format!("{native}\n").into_bytes());
+    assert_eq!(
+        live.serve(&mut duplex, 3, "v0.111.1").unwrap_err().code,
+        "producer_profile"
+    );
+    assert!(duplex.output.is_empty());
+    live.native_current = true;
+    duplex.input = Cursor::new(format!("{advisor}\n").into_bytes());
+    assert_eq!(
+        live.serve(&mut duplex, 3, "v0.111.1").unwrap_err().code,
+        "producer_profile"
+    );
+    assert!(duplex.output.is_empty());
+    duplex.input = Cursor::new(format!("{native}\n").into_bytes());
+    live.serve(&mut duplex, 3, "v0.111.1").unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&duplex.output).unwrap(),
+        reply
+    );
+    let latest = live.latest.lock().unwrap();
+    let admitted = &latest.pending.as_ref().unwrap().observation.board;
+    assert_eq!(admitted["native_current"], 1);
+    assert!(admitted.get("rng").is_none());
 }
 
 #[test]
 fn synthetic_cancelled_result_never_enters_reuse_cache() {
     let live = Live {
+        native_current: false,
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
         blocked_corpus: Mutex::new(None),

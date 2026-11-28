@@ -97,6 +97,9 @@ enum Mode {
     UncertaintyPoc,
     /// Show read-only recommendations from Spire Mentor's local Advisor lane.
     Live {
+        /// Use the separately staged native-current combat observer.
+        #[arg(long)]
+        native_current: bool,
         #[arg(long, default_value_t = 9002, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         #[arg(long, default_value_t = 1500, value_parser = clap::value_parser!(u64).range(1000..=5000))]
@@ -208,6 +211,7 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
             true,
         )),
         Mode::Live {
+            native_current,
             port,
             ttl_ms,
             release_info,
@@ -232,7 +236,10 @@ fn run(cli: Cli) -> Result<(Value, bool)> {
                 json,
                 capture_dir,
                 blocked_corpus,
-                &installed,
+                live::LiveProducer {
+                    build: &installed,
+                    native_current,
+                },
             )?;
             Ok((json!({"status":"stopped"}), true))
         }

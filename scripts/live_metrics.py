@@ -75,6 +75,9 @@ def summarize(events, captures):
     duplicate_receive = defaultdict(list)
     published = {}
     longest = {}
+    native_admitted = set()
+    native_blocked = set()
+    native_unfingerprintable = 0
     for event in events:
         status = event["status"]
         context = event.get("context")
@@ -83,6 +86,11 @@ def summarize(events, captures):
             contexts[context][status] += 1
         if status == "blocked":
             reasons[event["error"]["code"]] += 1
+            if event.get("observation") == "native-current-v1":
+                if "observation_id" in event:
+                    native_blocked.add(event["observation_id"])
+                else:
+                    native_unfingerprintable += 1
         elif status == "stale":
             stale_reasons[event["reason"]] += 1
             published.pop(key, None)
@@ -91,6 +99,8 @@ def summarize(events, captures):
             observation_ids[context][event["observation_id"]] += 1
             decision = decision_key(event, captures.get(key))
             decisions[context].add(decision)
+            if event.get("observation") == "native-current-v1":
+                native_admitted.add(event["observation_id"])
             if event.get("reused"):
                 contexts[context]["reused"] += 1
             if status == "ok":
@@ -124,12 +134,26 @@ def summarize(events, captures):
             "forward": latency(forwards[context]),
         }
     longest_position = max(longest, key=longest.get) if longest else None
+    native_blocked_only = native_blocked - native_admitted
+    native_total = len(native_admitted) + len(native_blocked_only)
     return {
         "events": dict(totals),
         "blocked_reasons": dict(reasons),
         "stale_reasons": dict(stale_reasons),
         "contexts": detail,
         "unique_scored_observations": sum(map(len, scored_observations.values())),
+        "native_current_combat_coverage": {
+            "admitted_unique": len(native_admitted),
+            "blocked_unique": len(native_blocked_only),
+            "admitted_and_blocked_unique": len(native_admitted & native_blocked),
+            "blocked_without_fingerprint": native_unfingerprintable,
+            "eligible_unique_fingerprinted": native_total,
+            "coverage_fingerprinted_pct": round(100 * len(native_admitted) / native_total, 3)
+            if native_total else None,
+            "coverage_counting_unfingerprintable_as_distinct_pct":
+                round(100 * len(native_admitted) / (native_total + native_unfingerprintable), 3)
+                if native_total + native_unfingerprintable else None,
+        },
         "receive_to_result": latency([v for ctx in receive.values() for v in ctx]),
         "forward": latency([v for ctx in forwards.values() for v in ctx]),
         "distinct_receive_to_result": latency([v for ctx in distinct_receive.values() for v in ctx]),

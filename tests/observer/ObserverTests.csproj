@@ -7,5 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../.local/observer-source/spire-mentor-mod/SpireMindLease.cs" Link="SpireMindLease.cs" />
+    <Compile Include="../../patches/SpireMindCurrent.cs" Link="SpireMindCurrent.cs" />
+    <Compile Include="../../.local/observer-source/spire-mentor-mod/SpireMindCurrentSchema.cs" Link="SpireMindCurrentSchema.cs" />
   </ItemGroup>
 </Project>

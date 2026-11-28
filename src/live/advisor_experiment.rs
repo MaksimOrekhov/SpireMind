@@ -270,6 +270,27 @@ struct FirstPolicy {
     logits: Vec<f32>,
 }
 
+fn policy_difference(expected: &FirstPolicy, other: &FirstPolicy) -> Vec<String> {
+    let mut fields = Vec::new();
+    if expected.action != other.action {
+        fields.push("preferred action".into());
+    }
+    if expected.classes != other.classes || expected.members != other.members {
+        fields.push("action classes".into());
+    }
+    match (&expected.row, &other.row) {
+        (Some(a), Some(b)) if a != b => {
+            fields.extend(super::compatibility::different_token_fields(a, b))
+        }
+        (None, Some(_)) | (Some(_), None) => fields.push("row presence".into()),
+        _ => {}
+    }
+    if expected.logits != other.logits {
+        fields.push("logits".into());
+    }
+    fields
+}
+
 fn candidate_policy(net: &E2eNet, mut rm: RunManager, expected: &Actions) -> Result<FirstPolicy> {
     let cs = rm
         .combat
@@ -408,6 +429,8 @@ pub(super) struct Experiment {
     stock: Stats,
     candidate: Stats,
     candidate_wire: Stats,
+    native_diagnostic: Option<Stats>,
+    wire_mismatches: BTreeMap<String, usize>,
     cold: Stats,
     missing: Stats,
     missing_mirror: AdvisorMirror,
@@ -433,6 +456,8 @@ impl Experiment {
             stock: Stats::default(),
             candidate: Stats::default(),
             candidate_wire: Stats::default(),
+            native_diagnostic: None,
+            wire_mismatches: BTreeMap::new(),
             cold: Stats::default(),
             missing: Stats::default(),
             missing_mirror: AdvisorMirror::new(true, false),
@@ -456,6 +481,10 @@ impl Experiment {
         self.missing_advisor.reset("offline run boundary");
         self.seen_fight = None;
         self.log_offset = 0;
+    }
+
+    pub(super) fn enable_native_diagnostic(&mut self) {
+        self.native_diagnostic = Some(Stats::default());
     }
 
     fn collect_mirror_stats(&mut self) {
@@ -538,6 +567,40 @@ impl Experiment {
             let mut frame = stock_board(rm, cs, actions, self.log_offset)?;
             frame["request_id"] = json!(self.snapshots.to_string());
             frame["state_id"] = json!(self.snapshots);
+            if let Some(stats) = self.native_diagnostic.as_mut() {
+                let start = Instant::now();
+                let mut producer = frame.clone();
+                producer["native_current"] = json!(super::native_current::VERSION);
+                // The mod advertises the PLAY verb even when all cards
+                // are disabled. Its per-card flags carry actual legality.
+                if !rows(&producer["available_actions"]).contains(&json!("PLAY")) {
+                    producer["available_actions"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(json!("PLAY"));
+                }
+                for (card, uid) in producer["hand"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                    .zip(&cs.player.hand)
+                {
+                    card["instance_id"] = json!(u64::from(uid.get()) + 1);
+                }
+                for enemy in producer["enemies"].as_array_mut().into_iter().flatten() {
+                    enemy["current_move"] = enemy["next_move_id"].take();
+                }
+                let result = super::native_current::sanitize(&producer)
+                    .and_then(|obs| super::engine::advise(net, &obs))
+                    .map(|event| {
+                        if event["status"] == "forced" {
+                            "forced"
+                        } else {
+                            "ok"
+                        }
+                    });
+                stats.add(rm, result, start.elapsed().as_secs_f64() * 1000.0);
+            }
             self.log_offset = cs.combat_log.event_log.rows().len();
             let result = stock_result(
                 &self.advisor,
@@ -628,12 +691,24 @@ impl Experiment {
                 let replayed = sts2_advisor::combat_mirror::build_state(&wire)
                     .map_err(|e| failure("candidate_wire_import", e))?;
                 let mut transported = candidate;
+                let deck = run_wire::master_deck_detailed(&transported);
+                let ench = run_wire::master_deck_enchantments(&transported);
                 transported.combat = Some(replayed.state);
-                if candidate_policy(net, transported, &expected)? != result {
-                    return Err(failure(
-                        "candidate_wire_parity",
-                        "Wire roundtrip changed classes, actions, tokens or logits",
-                    ));
+                let deck_changed = deck != run_wire::master_deck_detailed(&transported)
+                    || ench != run_wire::master_deck_enchantments(&transported);
+                let restored = candidate_policy(net, transported, &expected)?;
+                if restored != result {
+                    let mut differences = policy_difference(&result, &restored);
+                    if deck_changed {
+                        differences.push("effective master deck".into());
+                    }
+                    let detail = format!(
+                        "{}: {}",
+                        base["encounter_id"].as_str().unwrap_or("unknown encounter"),
+                        differences.join(", ")
+                    );
+                    *self.wire_mismatches.entry(detail.clone()).or_default() += 1;
+                    return Err(failure("candidate_wire_parity", detail));
                 }
                 Ok(outcome)
             })();
@@ -656,6 +731,8 @@ impl Experiment {
         self.collect_mirror_stats();
         json!({"stock":self.stock.export(),"candidate":self.candidate.export(),
             "candidate_wire_roundtrip":self.candidate_wire.export(),
+            "candidate_wire_mismatches":self.wire_mismatches,
+            "native_current_simulator_diagnostic":self.native_diagnostic.take().map(Stats::export),
             "stock_mirror":self.mirrors,"stock_checks":self.stock_checks,
             "stock_missing_history_control":self.missing.export(),"stock_reconnect_control":self.cold.export(),
             "candidate_hidden_redeal":self.invariance})

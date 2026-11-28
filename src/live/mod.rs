@@ -2,6 +2,7 @@ mod advisor_experiment;
 pub(crate) mod compatibility;
 mod diagnostics;
 mod engine;
+mod native_current;
 mod observation;
 mod powers;
 mod relics;
@@ -199,7 +200,9 @@ fn decorate(mut event: Value, obs: &Observation, p: Position, source: &str) -> V
     event["ascension"] = obs.board["run_state"]["ascension"].clone();
     event["model"] = json!(model::pin());
     event["upstream_revision"] = json!(model::REVISION);
-    event["observation"] = json!(if obs.context == crate::contract::Context::Combat {
+    event["observation"] = json!(if obs.board.get("native_current").is_some() {
+        native_current::PROFILE
+    } else if obs.context == crate::contract::Context::Combat {
         model::OBSERVED_COMBAT
     } else {
         model::OBSERVATION
@@ -224,6 +227,7 @@ fn persist(dir: &Path, job: &Job) -> io::Result<()> {
 }
 
 struct Live {
+    native_current: bool,
     latest: Mutex<Latest>,
     cache: Mutex<Option<CachedAdvice>>,
     blocked_corpus: Mutex<Option<diagnostics::Corpus>>,
@@ -433,6 +437,14 @@ impl Live {
                                 ));
                             }
                             observation::confirm_power_capability(&raw)?;
+                            let has_native = raw["capabilities"][native_current::CAPABILITY]
+                                == native_current::VERSION;
+                            if self.native_current != has_native {
+                                return Err(Failure::new(
+                                    "producer_profile",
+                                    "The staged native-current mod and --native-current must be used together",
+                                ));
+                            }
                             self.begin(p, at);
                             // A screen request remains in flight without this reply.
                             // The Ack has no best, options, gameplay fields or score.
@@ -440,7 +452,11 @@ impl Live {
                                 .expect("serializable fixed ack");
                             ack.push(b'\n');
                             socket.write_all(&ack).map_err(|_| link_error())?;
-                            let obs = session.observe(&raw, p);
+                            let obs = if self.native_current {
+                                session.observe_native(&raw, p)
+                            } else {
+                                session.observe(&raw, p)
+                            };
                             match obs {
                                 Ok(observation) => self.queue(Job {
                                     position: p,
@@ -448,10 +464,26 @@ impl Live {
                                     observation,
                                 }),
                                 Err(e) => {
-                                    self.record_block(&raw, p, "observation", e.code, None);
+                                    let context = observation::context(&raw).ok();
+                                    let native_combat = self.native_current
+                                        && context == Some(crate::contract::Context::Combat);
+                                    if !native_combat {
+                                        self.record_block(&raw, p, "observation", e.code, None);
+                                    }
                                     let mut event = blocked(e);
                                     event["position"] = json!(p);
-                                    event["context"] = json!(observation::context(&raw).ok());
+                                    event["context"] = json!(context);
+                                    if native_combat {
+                                        event["source"] = json!("advisor_tcp");
+                                        event["observation"] = json!(native_current::PROFILE);
+                                        if let Ok(board) = native_current::project_frame(&raw) {
+                                            event["observation_id"] =
+                                                json!(observation_id(&Observation {
+                                                    board,
+                                                    context: crate::contract::Context::Combat,
+                                                }));
+                                        }
+                                    }
                                     self.terminal.emit(&event);
                                     // Unsupported/ill-formed screens may have no lease.
                                     *self.latest.lock().unwrap() = Latest::default();
@@ -472,6 +504,11 @@ fn link_error() -> Failure {
     )
 }
 
+pub struct LiveProducer<'a> {
+    pub build: &'a str,
+    pub native_current: bool,
+}
+
 pub fn run(
     net: E2eNet,
     port: u16,
@@ -479,13 +516,14 @@ pub fn run(
     json_output: bool,
     capture: Option<PathBuf>,
     blocked_corpus: Option<PathBuf>,
-    expected_build: &str,
+    producer: LiveProducer<'_>,
 ) -> Result<()> {
     if let Some(path) = capture.as_deref() {
         fs::create_dir_all(path)
             .map_err(|_| Failure::new("capture_io", "Cannot create capture directory"))?;
     }
     let live = Arc::new(Live {
+        native_current: producer.native_current,
         latest: Mutex::new(Latest::default()),
         cache: Mutex::new(None),
         blocked_corpus: Mutex::new(
@@ -519,12 +557,15 @@ pub fn run(
     loop {
         if let Ok(socket) = TcpStream::connect_timeout(&address, RECONNECT) {
             session_id += 1;
-            let reason = live.connection(socket, session_id, expected_build).err();
+            let reason = live.connection(socket, session_id, producer.build).err();
             live.clear(&mut live.latest.lock().unwrap(), "disconnect");
             if let Some(error) = reason {
                 if matches!(
                     error.code,
-                    "lease_not_supported" | "producer_mismatch" | "incompatible_game_version"
+                    "lease_not_supported"
+                        | "producer_mismatch"
+                        | "incompatible_game_version"
+                        | "producer_profile"
                 ) {
                     return Err(error);
                 }
@@ -575,7 +616,7 @@ pub fn release_build(path: &Path) -> Result<String> {
 
 pub fn sanitize_file(input: &Path, output: &Path) -> Result<Value> {
     let raw = read_capture(input)?;
-    let o = observation::sanitize(&raw, observation::context(&raw)?)?;
+    let o = sanitize_capture(&raw)?;
     if o.board["map"].is_null() {
         return Err(Failure::new(
             "missing_visible_map",
@@ -594,6 +635,14 @@ pub fn sanitize_file(input: &Path, output: &Path) -> Result<Value> {
     )
 }
 
+fn sanitize_capture(raw: &Value) -> Result<Observation> {
+    if raw.get("native_current").is_some() {
+        native_current::sanitize(raw)
+    } else {
+        observation::sanitize(raw, observation::context(raw)?)
+    }
+}
+
 pub fn replay(net: &E2eNet, files: &[PathBuf]) -> Result<(Value, bool)> {
     let mut ok = true;
     let mut times = Vec::new();
@@ -601,7 +650,7 @@ pub fn replay(net: &E2eNet, files: &[PathBuf]) -> Result<(Value, bool)> {
     for (index, path) in files.iter().enumerate() {
         let raw = read_capture(path)?;
         let at = Instant::now();
-        let obs = observation::sanitize(&raw, observation::context(&raw)?)?;
+        let obs = sanitize_capture(&raw)?;
         let p = Position {
             session: 0,
             state_id: observation::number(&obs.board, "state_id", i64::MAX as u64)?,

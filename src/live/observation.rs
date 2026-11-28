@@ -549,7 +549,7 @@ pub fn point(v: &Value) -> Result<(u64, u64)> {
     Ok((number(v, "col", 15)?, number(v, "row", 40)?))
 }
 
-fn map(value: &Value) -> Result<Value> {
+pub(super) fn map(value: &Value) -> Result<Value> {
     let mut m = object(
         value,
         "row_count col_count current boss second_boss visited nodes",

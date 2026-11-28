@@ -189,6 +189,19 @@ impl Session {
         Ok(observation)
     }
 
+    pub(super) fn observe_native(
+        &mut self,
+        raw: &Value,
+        position: Position,
+    ) -> Result<Observation> {
+        if observation::context(raw)? != Context::Combat {
+            return self.observe(raw, position);
+        }
+        let mut observation = super::native_current::sanitize(raw)?;
+        self.attach_map(&mut observation, position)?;
+        Ok(observation)
+    }
+
     fn attach_map(&mut self, o: &mut Observation, position: Position) -> Result<()> {
         let b = &mut o.board;
         let version = string(b, "game_version")?.to_owned();

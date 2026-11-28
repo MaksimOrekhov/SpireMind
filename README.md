@@ -39,6 +39,8 @@ cargo run --release --locked -- recommend map --seed 160000000
 
 Live-клиент читает `advice_request` мода **Spire Mentor 0.11.10** с закреплённым расширением наблюдателя SpireMind. Заявленная граница — одиночный стандартный Ironclad A0 или A10, игра `v0.111.0` (`41cef1ea`) или `v0.111.1` (`cc1f9462`), модель SM-01. Фактический статус каждой поверхности записан в [отчёте SM-02](docs/research/live-results.md).
 
+Экспериментальная сборка наблюдателя `--native-current` включает боевой прототип C. Ей соответствует флаг `live --native-current`. Установка этой DLL согласуется отдельно. [Контракт, сборка и сценарий проверки](docs/research/native-current-prototype.md)
+
 1. Установите BaseLib 3.4.7 и сборку Spire Mentor 0.11.10 с [расширением жизненного цикла](docs/research/live-results.md#сборка-расширения-наблюдателя). Запустите игру с модами. В **Mod Configuration → Spire Mentor** выключите **Auto-launch Python advisor** и включите режим **Coach** или **Hints**. Оставьте Auto Play и Auto Battle выключенными.
 2. Из корня SpireMind выполните `python scripts/setup.py`, затем `python scripts/setup.py --check-source`. Соберите `cargo build --release --locked` в **x64 Native Tools Command Prompt for VS 2022**. Обновлённый MSVC нужен для транзитивного кода upstream. При запуске уже собранного CLI компилятор и Python не используются.
 3. Запустите советник в отдельном терминале. Обязательный `--release-info` указывает на `release_info.json` установленной игры. Клиент проверяет точную пару версии и коммита до подключения.
@@ -61,7 +63,7 @@ $snapshots = @(Get-ChildItem .local/live-captures -Filter 'advisor-*.json' | Sel
 python scripts/live_metrics.py .local/live-captures/events.jsonl --captures .local/live-captures
 ```
 
-Для live требуется сборка наблюдателя с `spiremind_power_visibility=1`. Каждый боевой эффект должен содержать булев маркер `observer_visible`. Совместимость старых санитизированных снимков сохраняется в `replay`.
+В профиле по умолчанию live требует `spiremind_power_visibility=1` и булев `observer_visible` для каждого боевого эффекта. `replay` продолжает открывать старые санитизированные снимки и распознаёт версию боевых кадров C.
 
 Для разбора блокировок добавьте к запуску `live` параметр `--blocked-corpus .local/blocked-a0`. Укажите новый каталог. Команда `python scripts/coverage_panel.py blockers .local/blocked-a0` ранжирует санитизированные причины отказов. ID эффекта указан, если игра подтвердила его видимость и он найден в закреплённом реестре. `spiremind compatibility` запускает отдельный офлайн-набор с исходным движком и весами Instinct. [Таблица эффектов и результаты](docs/research/combat-compatibility.md)
 

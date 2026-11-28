@@ -117,7 +117,7 @@ fn mismatch(code: &'static str, detail: &str) -> Failure {
     Failure::new(code, detail)
 }
 
-fn different_token_fields(a: &PolicyRow, b: &PolicyRow) -> BTreeSet<String> {
+pub(super) fn different_token_fields(a: &PolicyRow, b: &PolicyRow) -> BTreeSet<String> {
     use sts2_e2e::schema::{N_CAT, N_CONT, cat_name, cont_name, section_name};
     let mut fields = BTreeSet::new();
     if a.sec != b.sec || a.tok_flags != b.tok_flags {
@@ -1146,6 +1146,8 @@ pub enum ArchitecturePanel {
     Regression,
     Expanded,
     Validation,
+    /// Diagnose the existing native-wire mismatches in one Act 2 run.
+    WireDiagnostic,
 }
 
 pub fn architecture(
@@ -1180,6 +1182,14 @@ pub fn architecture(
             Sampling::Instinct(net),
             Some(4333),
         ),
+        ArchitecturePanel::WireDiagnostic => (
+            "wire-diagnostic",
+            754_255_493,
+            1,
+            1500,
+            Sampling::Instinct(net),
+            Some(610),
+        ),
         ArchitecturePanel::Validation => {
             let first = new_first_seed.ok_or_else(|| {
                 mismatch(
@@ -1205,6 +1215,9 @@ pub fn architecture(
     };
     let mut strict = Report::default();
     let mut comparison = Experiment::new(weights);
+    if matches!(panel, ArchitecturePanel::WireDiagnostic) {
+        comparison.enable_native_diagnostic();
+    }
     for seed in first..first + runs {
         comparison.run_boundary();
         walk(

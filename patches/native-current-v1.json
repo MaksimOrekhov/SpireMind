@@ -1,0 +1,77 @@
+{
+  "frame": {
+    "type": "s", "advice_for": "s", "state_id": "i", "request_id": "s",
+    "game_version": "s", "mod_version": "s", "player_count": "i", "act": "i", "act_name": "s",
+    "floor": "i", "current_room": "s", "run_state": "run", "map": "map", "capabilities": "caps",
+    "player": "player", "hand": ["card"], "draw_pile": "draw", "discard_pile": "pile",
+    "exhaust_pile": "pile", "play_pile": "pile", "enemies": ["enemy"], "potions": ["potion"],
+    "available_actions": ["s"], "round": "i", "room_type": "s", "encounter_id": "s",
+    "allies": ["empty"], "orbs": ["orb"], "orb_capacity": "i", "pets": ["enemy"]
+  },
+  "caps": { "spiremind_lease": "i", "spiremind_power_visibility": "i", "spiremind_native_current": "i" },
+  "run": {
+    "gold": "i", "hp": "i", "max_hp": "i", "potions": ["potion"], "potion_slot_count": "i",
+    "relics": ["relic"], "master_deck": ["card"], "ascension": "i", "game_mode": "s",
+    "character": "s", "is_last_act": "b", "awaiting_second_boss": "b"
+  },
+  "map": {
+    "row_count": "i", "col_count": "i", "current": "coord", "boss": "boss", "second_boss": "boss",
+    "visited": ["coord"], "nodes": ["node"]
+  },
+  "coord": { "col": "i", "row": "i" },
+  "boss": { "col": "i", "row": "i", "id": "s" },
+  "node": { "col": "i", "row": "i", "type": "s", "children": ["coord"] },
+  "player": {
+    "hp": "i", "max_hp": "i", "block": "i", "energy": "i", "max_energy": "i",
+    "powers": ["power"], "cards_played_this_turn": ["i"], "bound_card_played_this_turn": "b",
+    "hp_lost_this_turn": "b", "unblocked_hits_this_combat": "i", "powered_hits_this_turn": ["hit"],
+    "cards_exhausted_this_combat": "i", "cards_exhausted_this_turn": "i", "card_block_gains_this_turn": "i",
+    "discards_this_turn": "i", "cards_drawn_this_combat": "i", "cards_generated_this_combat": "i",
+    "extra_turns_taken_this_combat": "i"
+  },
+  "hit": { "enemy": "i", "hits": "i" },
+  "card": {
+    "id": "s", "name": "s", "type": "s", "target_type": "s", "upgrade_level": "i", "upgraded": "b", "instance_id": "i",
+    "cost": "i", "base_cost": "i", "persistent_cost": "i", "played_cost": "i", "stable_cost": "i",
+    "effective_cost": "i", "star_cost": "i", "persistent_star_cost": "i", "costs_x": "b",
+    "exhaust": "b", "innate": "b", "retain": "b", "ethereal": "b", "will_exhaust": "b",
+    "will_retain": "b", "sly": "b", "sly_this_turn": "b", "stats": "stats",
+    "affliction": "s", "affliction_stacks": "i", "enchantment": "s", "enchantment_amount": "i",
+    "observer_enchantment_status": "s", "base_replay_count": "i", "combat_vars": "card_vars",
+    "playable": "b", "unplayable_reason": "s", "valid_target_indices": ["i"]
+  },
+  "bag_card": {
+    "id": "s", "type": "s", "upgrade_level": "i", "upgraded": "b",
+    "cost": "i", "base_cost": "i", "persistent_cost": "i", "played_cost": "i", "stable_cost": "i",
+    "effective_cost": "i", "star_cost": "i", "persistent_star_cost": "i",
+    "stats": "stats", "affliction": "s", "affliction_stacks": "i", "enchantment": "s",
+    "enchantment_amount": "i", "observer_enchantment_status": "s", "base_replay_count": "i",
+    "combat_vars": "card_vars"
+  },
+  "stats": { "damage": "i", "block": "i" },
+  "card_vars": { "return_if_played_round": "i", "enchantment_used": "i" },
+  "pile": { "type": "s", "count": "i", "cards": ["card"] },
+  "draw": { "type": "s", "count": "i", "cards": ["bag_card", "sort"] },
+  "enemy": {
+    "id": "s", "combat_id": "i", "name": "s", "is_alive": "b", "is_hittable": "b",
+    "hp": "i", "max_hp": "i", "block": "i", "powers": ["power"], "intents": ["intent"],
+    "current_move": "s", "move_history": ["s"], "completed_move_flags": "move_flags",
+    "fabricator_last_spawned": "s", "curse_of_knowledge_counter": "i"
+  },
+  "move_flags": { "performed_first_move": "b", "performed": "b" },
+  "intent": { "kind": "s", "intent_type": "s", "damage": "i", "hits": "i", "total_damage": "i" },
+  "power": { "id": "s", "name": "s", "amount": "i", "display_amount": "i", "vars": "power_vars" },
+  "power_vars": {
+    "SelfDamage": "i", "HasGainedBlockThisTurn": "i", "Facing": "i", "Block": "i",
+    "Stolen": "i", "Damage": "i", "ExtraMultiClawCount": "i"
+  },
+  "relic": {
+    "id": "s", "name": "s", "counter": "i", "stack_count": "i", "is_wax": "b", "is_melted": "b", "status": "s"
+  },
+  "potion": {
+    "id": "s", "name": "s", "slot": "i", "empty": "b", "usage": "s", "can_use": "b",
+    "target_type": "s", "requires_target": "b", "valid_target_indices": ["i"]
+  },
+  "orb": { "id": "s", "name": "s", "passive_value": "i", "evoke_value": "i" },
+  "empty": {}
+}
